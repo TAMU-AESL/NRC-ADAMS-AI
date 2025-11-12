@@ -1,0 +1,47 @@
+{
+  "name": "adams_mcp",
+  "version": "0.1.0",
+  "description": "ADAMS MCP server providing NRC ADAMS search, download, and PDF text extraction tools for nuclear regulatory documents.",
+  "author": "ADAMS MCP Project",
+  "entrypoint": "python adams_mcp.py",
+  "tools": [
+    {
+      "name": "search_adams",
+      "description": "Search NRC ADAMS and Google for nuclear regulatory documents with hybrid results.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string", "description": "Search keywords (max 500 chars)"},
+          "max_pages": {"type": "integer", "default": 1, "description": "Number of ADAMS pages to fetch (1-10)"},
+          "top_n": {"type": "integer", "default": 5, "description": "Number of top results to return (1-50)"},
+          "use_google": {"type": "boolean", "default": true, "description": "Supplement with Google search results"}
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "download_adams",
+      "description": "Download an NRC document by accession number.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "accession_number": {"type": "string"},
+          "directory": {"type": "string", "default": "./downloads"}
+        },
+        "required": ["accession_number"]
+      }
+    },
+    {
+      "name": "summarize_pdf",
+      "description": "Extract text content from a downloaded ADAMS PDF file for LLM processing.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "Path to the PDF file"},
+          "max_chars": {"type": "integer", "default": 2000, "description": "Maximum characters to extract (100-10000)"}
+        },
+        "required": ["path"]
+      }
+    }
+  ]
+}

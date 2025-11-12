@@ -1,0 +1,14 @@
+# ADAMS MCP Server Dependencies
+
+# MCP Server Framework
+fastmcp>=0.1.0
+
+# HTTP requests and retry logic
+requests>=2.31.0
+urllib3>=2.0.0
+
+# PDF processing
+PyPDF2>=3.0.0
+
+# Python environment variable management (optional, for .env file support)
+python-dotenv>=1.0.0
