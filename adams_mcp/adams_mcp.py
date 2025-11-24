@@ -1,31 +1,52 @@
 import os
+import platform
 import logging
+from pathlib import Path
 from mcp.server.fastmcp import FastMCP
-from adams_client_v3 import AdamsClient
 from PyPDF2 import PdfReader
+from adams_client_v4 import AdamsClient
 
-# Load environment variables from .env file if it exists
+# Optional env loader
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except ImportError:
-    pass  # python-dotenv not installed, will use system env vars only
+except:
+    pass
 
-# ─────────────────────────────────────────────
-# Logging Setup — writes to file, not stdout
-# ─────────────────────────────────────────────
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
 logging.basicConfig(
     filename="mcp_server.log",
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-SERVER_VERSION = "0.1.0"
-logging.info("ADAMS MCP server initializing...")
+logging.info("Starting ADAMS MCP Server")
 
-# ─────────────────────────────────────────────
-# Initialize ADAMS client and MCP server
-# ─────────────────────────────────────────────
-# Load Google API credentials from environment variables
+from threading import Lock
+import time
+
+class SimpleRateLimiter:
+    def __init__(self, calls_per_minute=30):
+        self.calls_per_minute = calls_per_minute
+        self.interval = 60.0 / calls_per_minute
+        self.lock = Lock()
+        self.last_call = 0.0
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_call
+            if elapsed < self.interval:
+                delay = self.interval - elapsed
+                logging.info(f"Rate limiting active — waiting {delay:.2f}s")
+                time.sleep(delay)
+            self.last_call = time.time()
+
+rate_limiter = SimpleRateLimiter(calls_per_minute=20)
+
+# ------------------------------------------------------------
+# Initialize Client + MCP Engine
+# ------------------------------------------------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GOOGLE_CX = os.getenv("GOOGLE_CX")
 
@@ -36,157 +57,276 @@ client = AdamsClient(
 
 mcp = FastMCP("ADAMS_MCP")
 
-# ─────────────────────────────────────────────
-# Tools
-# ─────────────────────────────────────────────
+# ------------------------------------------------------------
+# Utility — Relevance Scoring
+# ------------------------------------------------------------
+def score_relevance(query: str, title: str | None, doc_type: str | None):
+    """Simple heuristic scoring for Claude to rank documents."""
+    if not title:
+        return 0
+
+    q_low = query.lower()
+    t_low = title.lower()
+
+    score = 0
+
+    if q_low in t_low:
+        score += 5
+    if any(word in t_low for word in q_low.split()):
+        score += 2
+    if doc_type and "safety" in doc_type.lower():
+        score += 1
+    if doc_type and "reactor" in doc_type.lower():
+        score += 1
+
+    return score
+
+# ------------------------------------------------------------
+# Tool: Search ADAMS (Hybrid: ADAMS + Google)
+# ------------------------------------------------------------
 @mcp.tool()
-async def search_adams(query: str, max_pages: int = 1, top_n: int = 5, use_google: bool = True):
-    """Search NRC ADAMS and Google for nuclear-related documents by keyword.
-    Combines both sources for richer, hybrid research results.
-
-    Args:
-        query: Search keywords (must be non-empty, max 500 characters)
-        max_pages: Number of result pages to fetch from ADAMS (1-10)
-        top_n: Number of top results to return (1-50)
-        use_google: Whether to supplement with Google search results
+async def search_adams(
+    query: str,
+    top_n: int = 5,
+    max_pages: int = 1,
+    use_google: bool = True
+):
     """
+    Search NRC ADAMS (and optionally Google) for documents.
+
+    • Expands query using synonyms (MSR → molten salt, etc.)
+    • Uses caching (5 minutes)
+    • Adds relevance scoring
+    • Returns rationale for each item
+    """
+    if not query or not query.strip():
+        return {"error": "Query cannot be empty"}
+
     try:
-        # Input validation
-        if not query or not query.strip():
-            return {"error": "Query cannot be empty"}
-        if len(query) > 500:
-            return {"error": "Query exceeds maximum length of 500 characters"}
-        if max_pages < 1 or max_pages > 10:
-            return {"error": "max_pages must be between 1 and 10"}
-        if top_n < 1 or top_n > 50:
-            return {"error": "top_n must be between 1 and 50"}
-        adams_results = []
+        # Step 1 — ADAMS search with synonym expansion
+        rate_limiter.wait()
+        adams_results = client.search(query, max_pages=max_pages)
+
+        enriched_adams = []
+        for doc in adams_results:
+            enriched_adams.append({
+                "title": doc.title,
+                "accession_number": doc.accession_number,
+                "source": "ADAMS",
+                "document_type": doc.document_type,
+                "score": score_relevance(query, doc.title, doc.document_type),
+                "rationale": f"Matched ADAMS index (document_type={doc.document_type})"
+            })
+
+        # Step 2 — Optional Google
         google_results = []
+        if use_google:
+            rate_limiter.wait()
+            g_results = client.google_search(f"site:pbadupws.nrc.gov {query}", num=top_n)
+            for item in g_results:
+                google_results.append({
+                    "title": item["title"],
+                    "link": item["link"],
+                    "snippet": item["snippet"],
+                    "source": "Google",
+                    "score": score_relevance(query, item["title"], None),
+                    "rationale": "Google match for NRC domain"
+                })
 
-        # ─────────────────────────────────────────────
-        # 1. Try NRC ADAMS Search
-        # ─────────────────────────────────────────────
-        try:
-            adams_results = client.search(query=query, max_pages=max_pages)
-            adams_results.sort(key=lambda d: (d.added_date or "", len(d.title or "")), reverse=True)
-            adams_top = [
-                {
-                    "title": d.title,
-                    "accession_number": d.accession_number,
-                    "date": d.document_date,
-                    "source": "ADAMS",
-                    "document_type": d.document_type,
-                }
-                for d in adams_results[:top_n]
-            ]
-        except Exception as e:
-            logging.warning(f"ADAMS search failed: {e}")
-            adams_top = []
+        # Step 3 — Combine + sort
+        combined = enriched_adams + google_results
+        combined.sort(key=lambda r: r["score"], reverse=True)
 
-        # ─────────────────────────────────────────────
-        # 2. Google Fallback or Supplementary Search
-        # ─────────────────────────────────────────────
-        if use_google and client.google_api_key and client.google_cx:
-            try:
-                google_results = client.google_search(f"site:pbadupws.nrc.gov {query}", num=top_n)
-                for item in google_results:
-                    item["source"] = "Google"
-            except Exception as g_err:
-                logging.warning(f"Google search failed: {g_err}")
-                google_results = []
-
-        # ─────────────────────────────────────────────
-        # 3. Merge and Deduplicate Results
-        # ─────────────────────────────────────────────
-        seen_titles = set()
-        combined = []
-        for r in adams_top + google_results:
-            title = r.get("title")
-            if title and title not in seen_titles:
-                seen_titles.add(title)
-                combined.append(r)
-
-        logging.info(f"search_adams: query='{query}', combined_results={len(combined)}")
-        return {"results": combined}
+        return {"results": combined[:top_n]}
 
     except Exception as e:
         logging.error(f"search_adams error: {e}")
         return {"error": str(e)}
 
+# ------------------------------------------------------------
+# Helper — Get OS Downloads Folder
+# ------------------------------------------------------------
+def get_system_downloads_folder():
+    """Returns the REAL OS downloads folder."""
+    home = Path.home()
 
+    # Windows & macOS & Linux default Downloads directory
+    downloads = home / "Downloads"
+
+    # Create ADAMS subfolder
+    adams_folder = downloads / "ADAMS"
+    adams_folder.mkdir(parents=True, exist_ok=True)
+
+    return adams_folder
+
+# ------------------------------------------------------------
+# Tool: Download a Single ADAMS Document (NEW VERSION)
+# ------------------------------------------------------------
 @mcp.tool()
-async def download_adams(accession_number: str, directory: str = "./downloads"):
-    """Download a document by NRC accession number.
-
-    Args:
-        accession_number: NRC accession number (e.g., 'ML12345A678')
-        directory: Directory to save the downloaded file (default: './downloads')
+async def download_adams(accession_number: str):
     """
+    Download an ADAMS document directly into the user's real OS Downloads folder.
+
+    Example:
+        C:/Users/Name/Downloads/ADAMS/ML12345A678.pdf
+    """
+    if not accession_number or not accession_number.strip():
+        return {"error": "Accession number required"}
+
     try:
-        # Input validation
-        if not accession_number or not accession_number.strip():
-            return {"error": "Accession number cannot be empty"}
-        if not accession_number.startswith("ML") or len(accession_number) != 11:
-            logging.warning(f"Accession number '{accession_number}' may not be in standard ML format")
-        os.makedirs(directory, exist_ok=True)
-        docs = client.search(filters={"AccessionNumber": accession_number})
-        if not docs:
-            msg = f"No document found for accession {accession_number}"
-            logging.warning(msg)
-            return {"error": msg}
-        path = docs[0].download(directory=directory)
-        logging.info(f"Downloaded {accession_number} to {path}")
-        return {"path": path}
+        # Build direct PDF URL (no searching needed)
+        if accession_number.startswith("ML") and len(accession_number) >= 10:
+            folder = accession_number[:6]
+            url = f"https://pbadupws.nrc.gov/docs/{folder}/{accession_number}.pdf"
+        else:
+            return {"error": f"Accession number '{accession_number}' is not valid"}
+
+        # Get system Downloads/ADAMS folder
+        download_dir = get_system_downloads_folder()
+
+        # Output path
+        file_path = download_dir / f"{accession_number}.pdf"
+
+        logging.info(f"Downloading {accession_number} → {file_path}")
+
+        # Perform the download
+        import requests
+        resp = requests.get(url, stream=True, timeout=20)
+
+        if resp.status_code != 200:
+            return {
+                "error": f"Download failed (status {resp.status_code})",
+                "url": url
+            }
+
+        with open(file_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+        return {
+            "message": "Download successful",
+            "accession_number": accession_number,
+            "path": str(file_path),
+            "folder": str(download_dir),
+            "url": url
+        }
+
     except Exception as e:
         logging.error(f"download_adams error: {e}")
         return {"error": str(e)}
 
-
+# ------------------------------------------------------------
+# Tool: Batch Download Many ADAMS Documents (New Version)
+# ------------------------------------------------------------
 @mcp.tool()
-async def summarize_pdf(path: str, max_chars: int = 2000):
-    """Extract and return text content from a downloaded PDF file from ADAMS.
-
-    Args:
-        path: File path to the PDF file
-        max_chars: Maximum number of characters to extract (default: 2000, max: 10000)
-
-    Note: This extracts the first max_chars of text from the PDF. For actual
-    summarization, the calling LLM should process this extracted text.
+async def download_adams_batch(accession_numbers: list[str]):
     """
+    Batch-download multiple ADAMS documents.
+
+    • Saves all PDFs into user's real OS Downloads/ADAMS folder
+    • Returns per-file success or error
+    """
+    if not accession_numbers or not isinstance(accession_numbers, list):
+        return {"error": "You must provide a list of accession numbers"}
+
+    # Get the real downloads folder
+    download_dir = get_system_downloads_folder()
+
+    results = []
+    for acc in accession_numbers:
+        acc = acc.strip()
+
+        if not acc or not acc.startswith("ML") or len(acc) < 10:
+            results.append({
+                "accession_number": acc,
+                "status": "failed",
+                "reason": "Invalid accession number format"
+            })
+            continue
+
+        try:
+            # Build NRC direct PDF URL
+            folder = acc[:6]
+            url = f"https://pbadupws.nrc.gov/docs/{folder}/{acc}.pdf"
+
+            file_path = download_dir / f"{acc}.pdf"
+
+            logging.info(f"[Batch] Downloading {acc} → {file_path}")
+
+            import requests
+            resp = requests.get(url, stream=True, timeout=20)
+
+            if resp.status_code != 200:
+                results.append({
+                    "accession_number": acc,
+                    "status": "failed",
+                    "reason": f"HTTP {resp.status_code}",
+                    "url": url
+                })
+                continue
+
+            with open(file_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+            results.append({
+                "accession_number": acc,
+                "status": "success",
+                "path": str(file_path),
+                "url": url
+            })
+
+        except Exception as e:
+            logging.error(f"Batch download error for {acc}: {e}")
+            results.append({
+                "accession_number": acc,
+                "status": "failed",
+                "reason": str(e)
+            })
+
+    return {
+        "folder": str(download_dir),
+        "results": results
+    }
+
+# ------------------------------------------------------------
+# Tool: Summarize PDF
+# ------------------------------------------------------------
+@mcp.tool()
+async def summarize_pdf(
+    path: str,
+    max_chars: int = 2000
+):
+    """
+    Extract text from a PDF for LLM summarization.
+    """
+    if not os.path.exists(path):
+        return {"error": f"File not found: {path}"}
+
     try:
-        # Input validation
-        if not path or not path.strip():
-            return {"error": "Path cannot be empty"}
-        if not os.path.exists(path):
-            return {"error": f"File not found: {path}"}
-        if not path.lower().endswith('.pdf'):
-            return {"error": "File must be a PDF"}
-        if max_chars < 100 or max_chars > 10000:
-            return {"error": "max_chars must be between 100 and 10000"}
-
         reader = PdfReader(path)
-        total_pages = len(reader.pages)
-        text = " ".join([p.extract_text() or "" for p in reader.pages])
+        text = " ".join((p.extract_text() or "") for p in reader.pages)
+        text = " ".join(text.split())  # clean whitespace
 
-        # Clean up whitespace
-        text = " ".join(text.split())
-
-        extracted = text[:max_chars] + ("..." if len(text) > max_chars else "")
-        logging.info(f"summarize_pdf: extracted {len(extracted)} chars from {path} ({total_pages} pages)")
+        result = text[:max_chars] + ("..." if len(text) > max_chars else "")
 
         return {
-            "text": extracted,
-            "total_pages": total_pages,
+            "text": result,
+            "total_pages": len(reader.pages),
             "total_chars": len(text),
-            "extracted_chars": len(extracted)
+            "extracted": len(result)
         }
+
     except Exception as e:
         logging.error(f"summarize_pdf error: {e}")
         return {"error": str(e)}
 
-# ─────────────────────────────────────────────
-# Run the MCP Server
-# ─────────────────────────────────────────────
+# ------------------------------------------------------------
+# Run MCP Server
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    logging.info("✅ Starting ADAMS MCP server with Google hybrid search...")
+    logging.info("ADAMS MCP Server v2 is running...")
     mcp.run()
+
