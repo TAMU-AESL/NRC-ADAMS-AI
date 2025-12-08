@@ -1,6 +1,7 @@
 import os
 import platform
 import logging
+import re
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from PyPDF2 import PdfReader
@@ -32,6 +33,7 @@ class SimpleRateLimiter:
         self.interval = 60.0 / calls_per_minute
         self.lock = Lock()
         self.last_call = 0.0
+
     def wait(self):
         with self.lock:
             now = time.time()
@@ -54,32 +56,187 @@ client = AdamsClient(
     google_api_key=GOOGLE_API_KEY,
     google_cx=GOOGLE_CX
 )
+print("Loaded Google key:", GOOGLE_API_KEY)
+print("Loaded CX:", GOOGLE_CX)
 
 mcp = FastMCP("ADAMS_MCP")
 
 # ------------------------------------------------------------
 # Utility — Relevance Scoring
 # ------------------------------------------------------------
-def score_relevance(query: str, title: str | None, doc_type: str | None):
-    """Simple heuristic scoring for Claude to rank documents."""
-    if not title:
-        return 0
+def tokenize(text: str) -> set[str]:
+    """Tokenize a string into a set of alphanumeric lowercase tokens."""
+    return set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
 
-    q_low = query.lower()
-    t_low = title.lower()
+def ngram_score(query_tokens: set[str], title_tokens: set[str]) -> float:
+    """
+    Give extra weight to multi-word phrase (bigram) matches between
+    the query and the title.
+    """
+    score = 0.0
+    title_str = " ".join(title_tokens)
+    query_list = list(query_tokens)
 
-    score = 0
-
-    if q_low in t_low:
-        score += 5
-    if any(word in t_low for word in q_low.split()):
-        score += 2
-    if doc_type and "safety" in doc_type.lower():
-        score += 1
-    if doc_type and "reactor" in doc_type.lower():
-        score += 1
+    for i in range(len(query_list) - 1):
+        bigram = f"{query_list[i]} {query_list[i+1]}"
+        if bigram in title_str:
+            score += 3.0
 
     return score
+
+def score_relevance(query: str, title: str | None, doc_type: str | None):
+    """
+    Improved relevance scoring combining:
+      • token overlap (Jaccard-weighted)
+      • exact phrase inclusion
+      • bigram-based n-gram scoring
+      • domain-specific boosts on document_type
+    """
+    if not title:
+        return 0.0
+
+    query_tokens = tokenize(query)
+    title_tokens = tokenize(title)
+
+    score = 0.0
+
+    # Token overlap / Jaccard-style weighting
+    overlap = query_tokens & title_tokens
+    if overlap:
+        jaccard = len(overlap) / max(len(query_tokens), 1)
+        score += jaccard * 10.0
+
+    # Exact phrase match
+    if query.lower() in title.lower():
+        score += 8.0
+
+    # N-gram / bigram score
+    score += ngram_score(query_tokens, title_tokens)
+
+    # Domain-specific boosts
+    if doc_type:
+        dt_lower = doc_type.lower()
+        if "reactor" in dt_lower:
+            score += 2.0
+        if "safety" in dt_lower:
+            score += 1.0
+        if "event" in dt_lower:
+            score += 0.5
+        if "inspection" in dt_lower:
+            score += 1.5
+
+    return round(score, 2)
+
+# ------------------------------------------------------------
+# Filtering & Sorting for Search Results
+# ------------------------------------------------------------
+def apply_filters(results: list[dict], filters: dict | None) -> list[dict]:
+    """
+    Apply user-specified filters to the combined result list.
+
+    Supported filters keys:
+      - "source": "ADAMS" or "Google"
+      - "document_type": substring match on document_type
+      - "title_contains": substring that must appear in title
+      - "title_not_contains": substring that must NOT appear in title
+      - "accession_startswith": prefix for accession_number (e.g., "ML23")
+      - "min_score": minimum relevance score (inclusive)
+      - "max_score": maximum relevance score (inclusive)
+    """
+    if not filters:
+        return results
+
+    filtered = []
+
+    for r in results:
+        ok = True
+
+        # Filter: source
+        if "source" in filters:
+            if r.get("source", "").lower() != str(filters["source"]).lower():
+                ok = False
+
+        # Filter: document_type (substring match)
+        if "document_type" in filters:
+            dt = r.get("document_type", "") or ""
+            if str(filters["document_type"]).lower() not in dt.lower():
+                ok = False
+
+        # Filter: title_contains
+        if "title_contains" in filters:
+            if str(filters["title_contains"]).lower() not in r.get("title", "").lower():
+                ok = False
+
+        # Filter: title_not_contains
+        if "title_not_contains" in filters:
+            if str(filters["title_not_contains"]).lower() in r.get("title", "").lower():
+                ok = False
+
+        # Filter: accession_startswith
+        if "accession_startswith" in filters:
+            acc = r.get("accession_number", "") or ""
+            if not acc.startswith(str(filters["accession_startswith"])):
+                ok = False
+
+        # Filter: min_score
+        if "min_score" in filters:
+            try:
+                if r.get("score", 0) < float(filters["min_score"]):
+                    ok = False
+            except (TypeError, ValueError):
+                pass
+
+        # Filter: max_score
+        if "max_score" in filters:
+            try:
+                if r.get("score", 0) > float(filters["max_score"]):
+                    ok = False
+            except (TypeError, ValueError):
+                pass
+
+        if ok:
+            filtered.append(r)
+
+    return filtered
+
+
+def sort_results(
+    results: list[dict],
+    sort_by: str = "score",
+    descending: bool = True
+) -> list[dict]:
+    """
+    Sort the results list by a given key.
+
+    Allowed sort_by values (for now):
+      - "score" (default)
+      - "title"
+      - "accession_number"
+      - "source"
+      - "document_type"
+
+    Fallback: if the chosen sort_by key doesn't exist, we fall back to "score".
+    """
+    if not results:
+        return results
+
+    # If the desired sort key isn't present, fall back to "score"
+    candidate_key = sort_by
+    if candidate_key not in results[0]:
+        candidate_key = "score"
+
+    def key_fn(r: dict):
+        val = r.get(candidate_key, "")
+        # Normalize strings to lowercase for consistent sorting
+        if isinstance(val, str):
+            return val.lower()
+        return val
+
+    try:
+        return sorted(results, key=key_fn, reverse=descending)
+    except Exception as e:
+        logging.error(f"sort_results error (sort_by={sort_by}): {e}")
+        return results
 
 # ------------------------------------------------------------
 # Tool: Search ADAMS (Hybrid: ADAMS + Google)
@@ -89,15 +246,48 @@ async def search_adams(
     query: str,
     top_n: int = 5,
     max_pages: int = 1,
-    use_google: bool = True
+    use_google: bool = True,
+    filters: dict | None = None,
+    sort_by: str = "score",
+    sort_desc: bool = True
 ):
     """
     Search NRC ADAMS (and optionally Google) for documents.
 
-    • Expands query using synonyms (MSR → molten salt, etc.)
-    • Uses caching (5 minutes)
+    • Expands query using synonyms (MSR → molten salt, etc.) via AdamsClient
+    • Uses rate limiting
     • Adds relevance scoring
+    • Supports filtering and sorting
     • Returns rationale for each item
+
+    Parameters
+    ----------
+    query : str
+        Search query.
+    top_n : int
+        Maximum number of items to return after filtering + sorting.
+    max_pages : int
+        Maximum ADAMS pages to search via AdamsClient.
+    use_google : bool
+        Whether to also search Google (NRC domain only).
+    filters : dict | None
+        Optional filter dictionary. Supported keys:
+          - "source": "ADAMS" or "Google"
+          - "document_type": substring match on document_type
+          - "title_contains": substring that must appear in title
+          - "title_not_contains": substring that must NOT appear in title
+          - "accession_startswith": prefix for accession_number (e.g., "ML23")
+          - "min_score": minimum relevance score (inclusive)
+          - "max_score": maximum relevance score (inclusive)
+    sort_by : str
+        Field to sort by. Options:
+          - "score" (default)
+          - "title"
+          - "accession_number"
+          - "source"
+          - "document_type"
+    sort_desc : bool
+        Sort in descending order (True) or ascending (False).
     """
     if not query or not query.strip():
         return {"error": "Query cannot be empty"}
@@ -107,50 +297,53 @@ async def search_adams(
         rate_limiter.wait()
         adams_results = client.search(query, max_pages=max_pages)
 
-        enriched_adams = []
+        enriched_adams: list[dict] = []
         for doc in adams_results:
             enriched_adams.append({
                 "title": doc.title,
                 "accession_number": doc.accession_number,
                 "source": "ADAMS",
-                "document_type": doc.document_type,
-                "score": score_relevance(query, doc.title, doc.document_type),
-                "rationale": f"Matched ADAMS index (document_type={doc.document_type})"
+                "document_type": getattr(doc, "document_type", None),
+                "score": score_relevance(query, doc.title, getattr(doc, "document_type", None)),
+                "rationale": f"Matched ADAMS index (document_type={getattr(doc, 'document_type', None)})"
             })
 
         # Step 2 — Optional Google
-        google_results = []
+        google_results: list[dict] = []
         if use_google:
             rate_limiter.wait()
             g_results = client.google_search(f"site:pbadupws.nrc.gov {query}", num=top_n)
             for item in g_results:
                 google_results.append({
-                    "title": item["title"],
-                    "link": item["link"],
-                    "snippet": item["snippet"],
+                    "title": item.get("title"),
+                    "link": item.get("link"),
+                    "snippet": item.get("snippet"),
                     "source": "Google",
-                    "score": score_relevance(query, item["title"], None),
+                    "score": score_relevance(query, item.get("title"), None),
                     "rationale": "Google match for NRC domain"
                 })
 
-        # Step 3 — Combine + sort
+        # Step 3 — Combine
         combined = enriched_adams + google_results
-        combined.sort(key=lambda r: r["score"], reverse=True)
 
+        # Step 4 — Apply filters (if any)
+        combined = apply_filters(combined, filters)
+
+        # Step 5 — Sort results
+        if combined:
+            combined = sort_results(combined, sort_by=sort_by, descending=sort_desc)
+
+        # Step 6 — Return the top_n results
         return {"results": combined[:top_n]}
 
     except Exception as e:
         logging.error(f"search_adams error: {e}")
         return {"error": str(e)}
 
-# ------------------------------------------------------------
-# Helper — Get OS Downloads Folder
-# ------------------------------------------------------------
 def get_system_downloads_folder():
     """Returns the REAL OS downloads folder."""
     home = Path.home()
 
-    # Windows & macOS & Linux default Downloads directory
     downloads = home / "Downloads"
 
     # Create ADAMS subfolder
@@ -323,10 +516,10 @@ async def summarize_pdf(
         logging.error(f"summarize_pdf error: {e}")
         return {"error": str(e)}
 
+
 # ------------------------------------------------------------
 # Run MCP Server
 # ------------------------------------------------------------
 if __name__ == "__main__":
     logging.info("ADAMS MCP Server v2 is running...")
     mcp.run()
-
