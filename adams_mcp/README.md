@@ -1,7 +1,7 @@
 # ADAMS MCP Server
 
 A Model Context Protocol (MCP) server that provides LLMs and AI agents with tools to search, download, and extract text from documents in the NRC ADAMS (Agencywide Documents Access and Management System) repository.
-
+This is something that I am continuously working to optimize to provide better results.
 ## Features
 
 - **Hybrid Search**: Search NRC ADAMS database with optional Google Custom Search supplementation
