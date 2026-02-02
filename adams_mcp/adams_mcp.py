@@ -1,26 +1,48 @@
+"""
+ADAMS MCP Server - NRC Document Search and Retrieval (APS / v5)
+
+Uses adams_client_v5 (APS REST API) and auto-enables legacy library only
+when the query implies pre-1999 (e.g., 1990-1995).
+
+Tools:
+- search_adams
+- get_document
+- download_adams
+- download_adams_batch
+- summarize_pdf
+"""
+
 import os
 import logging
 import re
 import time
 from pathlib import Path
 from threading import Lock
-from typing import Optional, Dict, List, Any
-from datetime import datetime
+from typing import Optional, Dict, List, Any, Tuple
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 import requests
 
 from mcp.server.fastmcp import FastMCP
-from adams_client_v4 import AdamsClient
+from adams_client_v5 import AdamsClient, AdamsDocument, AdamsAPIError
 
+# ------------------------------------------------------------
 # Environment
+# ------------------------------------------------------------
 load_dotenv()
 
+ADAMS_API_KEY = os.getenv("ADAMS_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GOOGLE_CX = os.getenv("GOOGLE_CX")
 
-# Logging Configuration
+MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
+MCP_PORT = int(os.getenv("MCP_PORT", "3101"))
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http")  # stdio, sse, streamable-http
+
+# ------------------------------------------------------------
+# Logging
 # ------------------------------------------------------------
 logging.basicConfig(
     filename="mcp_server.log",
@@ -28,36 +50,15 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 )
 
-# Create separate loggers for different components
 logger = logging.getLogger("ADAMS_MCP")
 search_logger = logging.getLogger("ADAMS_MCP.search")
 download_logger = logging.getLogger("ADAMS_MCP.download")
 pdf_logger = logging.getLogger("ADAMS_MCP.pdf")
 
-logger.info("Starting ADAMS MCP Server")
+logger.info("Starting ADAMS MCP Server (APS / adams_client_v5)")
+logger.info("ADAMS_API_KEY present? %s", bool(os.getenv("ADAMS_API_KEY")))
 
-# Custom Exceptions
 # ------------------------------------------------------------
-class AdamsError(Exception):
-    """Base exception for ADAMS operations"""
-    pass
-
-class InvalidAccessionError(AdamsError):
-    """Invalid accession number format"""
-    pass
-
-class DownloadError(AdamsError):
-    """Failed to download document"""
-    pass
-
-class PDFProcessingError(AdamsError):
-    """Failed to process PDF"""
-    pass
-
-class SearchError(AdamsError):
-    """Search operation failed"""
-    pass
-
 # Rate Limiter
 # ------------------------------------------------------------
 class SimpleRateLimiter:
@@ -76,67 +77,155 @@ class SimpleRateLimiter:
 
 rate_limiter = SimpleRateLimiter()
 
-# Client + MCP
+# ------------------------------------------------------------
+# AdamsClient + MCP_Tool
 # ------------------------------------------------------------
 client = AdamsClient(
+    api_key=ADAMS_API_KEY,
     google_api_key=GOOGLE_API_KEY,
-    google_cx=GOOGLE_CX
+    google_cx=GOOGLE_CX,
 )
 
-mcp = FastMCP("ADAMS_MCP")
+mcp = FastMCP(
+    "ADAMS_MCP",
+    host=MCP_HOST,
+    port=MCP_PORT,
+)
 
-# Validation Functions
+if not ADAMS_API_KEY:
+    logger.warning(
+        "ADAMS_API_KEY not set. API calls will fail. "
+        "Get a key from https://adams-api-developer.nrc.gov/"
+    )
+
 # ------------------------------------------------------------
-def validate_accession_number(accession: str) -> tuple[bool, Optional[str]]:
-    """
-    Validate accession number format.
-    Returns (is_valid, error_message)
-    """
+# Validation
+# ------------------------------------------------------------
+def validate_accession_number(accession: str) -> Tuple[bool, Optional[str]]:
     if not accession:
         return False, "Accession number cannot be empty"
-    
     if not isinstance(accession, str):
         return False, "Accession number must be a string"
-    
+    accession = accession.strip().upper()
     if not accession.startswith("ML"):
         return False, "Accession number must start with 'ML'"
-    
     if len(accession) < 8:
         return False, "Accession number is too short"
-    
-    # Check if it contains only valid characters (letters and numbers)
-    if not re.match(r'^ML[A-Za-z0-9]+$', accession):
+    if not re.match(r"^ML[A-Za-z0-9]+$", accession):
         return False, "Accession number contains invalid characters"
-    
     return True, None
 
-def validate_query(query: str) -> tuple[bool, Optional[str]]:
-    """
-    Validate search query.
-    Returns (is_valid, error_message)
-    """
+
+def validate_query(query: str) -> Tuple[bool, Optional[str]]:
     if not query or not query.strip():
         return False, "Query cannot be empty"
-    
     if len(query.strip()) < 2:
         return False, "Query must be at least 2 characters"
-    
     if len(query) > 500:
         return False, "Query is too long (max 500 characters)"
-    
     return True, None
 
-# Util — Tokenization & Relevance
+# ------------------------------------------------------------
+# Utils: Year Detection
+# ------------------------------------------------------------
+def extract_year_range(query: str) -> Optional[Tuple[int, int]]:
+    """
+    Recognizes:
+      - "1990-1995"
+      - "1990 to 1995"
+      - "from 1990 to 1995"
+      - single year "1992"
+    """
+    q = query or ""
+    m = re.search(r"(19\d{2}|20\d{2})\s*(?:[-–]|to)\s*(19\d{2}|20\d{2})", q, flags=re.IGNORECASE)
+    if m:
+        y1, y2 = int(m.group(1)), int(m.group(2))
+        return (min(y1, y2), max(y1, y2))
+
+    m = re.search(r"(19\d{2}|20\d{2})", q)
+    if m:
+        y = int(m.group(1))
+        return (y, y)
+
+    return None
+
+
+def query_implies_pre_1999(query: str) -> bool:
+    yr = extract_year_range(query)
+    if not yr:
+        return False
+    start_y, _ = yr
+    return start_y < 1999
+
+
+def year_range_to_dates(year_range: Tuple[int, int]) -> Tuple[str, str]:
+    start_y, end_y = year_range
+    return f"{start_y:04d}-01-01", f"{end_y:04d}-12-31"
+
+
+def build_api_filters_from_inputs(
+    *,
+    query: str,
+    docket_number: Optional[str],
+    document_type: Optional[str],
+    days_back: Optional[int],
+    user_filters: Optional[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """
+    Build APS filters using adams_client_v5 helpers where possible.
+    Also injects query-implied year range into DocumentDate filters.
+    """
+    api_filters: List[Dict[str, str]] = []
+
+    # 1) docket/document_type
+    if docket_number:
+        api_filters.append(client.build_text_filter("DocketNumber", docket_number, "starts"))
+
+    if document_type:
+        api_filters.append(client.build_text_filter("DocumentType", document_type, "equals"))
+
+    # 2) days_back => DateAddedTimestamp >= cutoff
+    if days_back:
+        cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        api_filters.append(client.build_date_filter("DateAddedTimestamp", "ge", cutoff_date))
+
+    # 3) user-provided date_from/date_to => DocumentDate range
+    #    (push into API, not post-filter only)
+    if user_filters:
+        if "date_from" in user_filters:
+            api_filters.append(client.build_date_filter("DocumentDate", "ge", str(user_filters["date_from"])))
+        if "date_to" in user_filters:
+            api_filters.append(client.build_date_filter("DocumentDate", "le", str(user_filters["date_to"])))
+
+        # document_type can also be provided via user_filters
+        if "document_type" in user_filters and not document_type:
+            dt = user_filters["document_type"]
+            if isinstance(dt, str):
+                api_filters.append(client.build_text_filter("DocumentType", dt, "equals"))
+            elif isinstance(dt, list):
+                # AND semantics: multiple equals will be too strict.
+                # Use only the first here; users can call multiple searches if needed.
+                if dt:
+                    api_filters.append(client.build_text_filter("DocumentType", str(dt[0]), "equals"))
+
+    # 4) query-implied year range (only if user didn't already set date_from/date_to)
+    yr = extract_year_range(query)
+    user_set_dates = bool(user_filters and ("date_from" in user_filters or "date_to" in user_filters))
+    if yr and not user_set_dates:
+        d_from, d_to = year_range_to_dates(yr)
+        api_filters.append(client.build_date_filter("DocumentDate", "ge", d_from))
+        api_filters.append(client.build_date_filter("DocumentDate", "le", d_to))
+
+    return api_filters
+
+# ------------------------------------------------------------
+# Relevance / dedupe / post-filters
 # ------------------------------------------------------------
 def tokenize(text: str) -> set[str]:
-    """Extract alphanumeric tokens from text."""
-    return set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
+    return set(re.findall(r"[a-zA-Z0-9]+", (text or "").lower()))
+
 
 def score_relevance(query: str, title: Optional[str], doc_type: Optional[str]) -> float:
-    """
-    Score relevance of a document to the search query.
-    Returns a float score where higher is more relevant.
-    """
     if not title:
         return 0.0
 
@@ -160,170 +249,80 @@ def score_relevance(query: str, title: Optional[str], doc_type: Optional[str]) -
 
     return round(score, 2)
 
-# Util - Deduplication
-# ------------------------------------------------------------
+
 def fingerprint_result(item: dict) -> str:
-    """Create a unique fingerprint for a search result."""
     if item.get("accession_number"):
         return item["accession_number"]
     if item.get("link"):
         return item["link"].lower().strip()
     return (item.get("title") or "").lower().strip()
 
-# Util — Robust PDF Fetch
-# ------------------------------------------------------------
-def fetch_pdf(url: str, retries: int = 3, timeout: int = 20) -> Optional[bytes]:
-    """
-    Fetch PDF from URL with retries and validation.
-    Returns PDF bytes or None if failed.
-    """
-    for attempt in range(1, retries + 1):
+
+def apply_post_filters(results: List[Dict[str, Any]], filters: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not filters:
+        return results
+
+    filtered = results
+
+    # min_score (local)
+    if "min_score" in filters:
         try:
-            download_logger.info(f"Fetching PDF (attempt {attempt}/{retries}): {url}")
-            
-            response = requests.get(url, timeout=timeout, stream=True)
-            response.raise_for_status()
-            
-            # Validate content type
-            content_type = response.headers.get("Content-Type", "").lower()
-            if "pdf" not in content_type:
-                download_logger.warning(f"Non-PDF content type: {content_type}")
-                return None
-            
-            # Check content length if available
-            content_length = response.headers.get("Content-Length")
-            if content_length:
-                size_mb = int(content_length) / (1024 * 1024)
-                download_logger.info(f"PDF size: {size_mb:.2f} MB")
-                
-                if int(content_length) > 50_000_000:  # 50MB limit
-                    download_logger.error(f"PDF too large: {size_mb:.2f} MB")
-                    raise DownloadError(f"PDF exceeds size limit: {size_mb:.2f} MB")
-            
-            content = response.content
-            download_logger.info(f"Successfully fetched PDF: {len(content)} bytes")
-            return content
-            
-        except requests.exceptions.Timeout as e:
-            download_logger.warning(f"Timeout on attempt {attempt}: {e}")
-        except requests.exceptions.HTTPError as e:
-            download_logger.error(f"HTTP error on attempt {attempt}: {e}")
-            if response.status_code in [404, 403, 401]:
-                # Don't retry for these errors
-                return None
-        except requests.exceptions.RequestException as e:
-            download_logger.error(f"Request failed on attempt {attempt}: {e}")
-        except Exception as e:
-            download_logger.exception(f"Unexpected error on attempt {attempt}: {e}")
-        
-        if attempt < retries:
-            wait_time = 2 ** attempt  # Exponential backoff
-            download_logger.info(f"Waiting {wait_time}s before retry...")
-            time.sleep(wait_time)
-    
-    download_logger.error(f"Failed to fetch PDF after {retries} attempts")
-    return None
+            min_score = float(filters["min_score"])
+            filtered = [r for r in filtered if r.get("score", 0) >= min_score]
+        except Exception:
+            pass
 
-# Util - Chunked Text Collection
+    # source (back-compat only)
+    if "source" in filters:
+        src = filters["source"]
+        filtered = [r for r in filtered if r.get("source") == src]
+
+    return filtered
+
 # ------------------------------------------------------------
-def chunk_text(text: str, max_chars: int, chunk_size: int = 1200) -> str:
-    """Extract text chunks up to max_chars."""
-    chunks = []
-    total = 0
-
-    for i in range(0, len(text), chunk_size):
-        chunk = text[i:i + chunk_size]
-        chunks.append(chunk)
-        total += len(chunk)
-        if total >= max_chars:
-            break
-
-    return " ".join(chunks)
-
 # Downloads Folder
 # ------------------------------------------------------------
 def get_downloads_folder() -> Path:
-    """Get or create the ADAMS downloads folder."""
     path = Path.home() / "Downloads" / "ADAMS"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
-# Filter Application
 # ------------------------------------------------------------
-def apply_filters(results: List[Dict[str, Any]], filters: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Apply filters to search results.
-    
-    Supported filters:
-    - document_type: str or List[str] - Filter by document type(s)
-    - min_score: float - Minimum relevance score
-    - source: str - Filter by source (ADAMS or Google)
-    - date_from: str - Filter documents from this date (YYYY-MM-DD)
-    - date_to: str - Filter documents to this date (YYYY-MM-DD)
-    """
-    if not filters:
-        return results
-    
-    filtered = results
-    
-    # Filter by document type
-    if "document_type" in filters:
-        doc_types = filters["document_type"]
-        if isinstance(doc_types, str):
-            doc_types = [doc_types]
-        
-        filtered = [
-            r for r in filtered 
-            if r.get("document_type") and r["document_type"] in doc_types
-        ]
-        search_logger.info(f"Filtered by document_type: {len(filtered)} results remain")
-    
-    # Filter by minimum score
-    if "min_score" in filters:
-        min_score = float(filters["min_score"])
-        filtered = [r for r in filtered if r.get("score", 0) >= min_score]
-        search_logger.info(f"Filtered by min_score {min_score}: {len(filtered)} results remain")
-    
-    # Filter by source
-    if "source" in filters:
-        source = filters["source"]
-        filtered = [r for r in filtered if r.get("source") == source]
-        search_logger.info(f"Filtered by source {source}: {len(filtered)} results remain")
-    
-    # Filter by date range (if date information is available)
-    if "date_from" in filters or "date_to" in filters:
-        date_filtered = []
-        for r in filtered:
-            doc_date = r.get("date") or r.get("document_date")
-            if doc_date:
-                try:
-                    if isinstance(doc_date, str):
-                        doc_date = datetime.fromisoformat(doc_date.split("T")[0])
-                    
-                    if "date_from" in filters:
-                        date_from = datetime.fromisoformat(filters["date_from"])
-                        if doc_date < date_from:
-                            continue
-                    
-                    if "date_to" in filters:
-                        date_to = datetime.fromisoformat(filters["date_to"])
-                        if doc_date > date_to:
-                            continue
-                    
-                    date_filtered.append(r)
-                except (ValueError, TypeError) as e:
-                    search_logger.warning(f"Invalid date format: {doc_date}, error: {e}")
-                    continue
-            else:
-                # Keep results without dates if no strict date filtering
-                date_filtered.append(r)
-        
-        filtered = date_filtered
-        search_logger.info(f"Filtered by date range: {len(filtered)} results remain")
-    
-    return filtered
+# Robust PDF Fetch
+# ------------------------------------------------------------
+def fetch_pdf(url: str, retries: int = 3, timeout: int = 20) -> Optional[bytes]:
+    for attempt in range(1, retries + 1):
+        try:
+            download_logger.info(f"Fetching PDF (attempt {attempt}/{retries}): {url}")
+            response = requests.get(url, timeout=timeout, stream=True)
+            response.raise_for_status()
 
-# Tool - Search_ADAMS
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "pdf" not in content_type:
+                download_logger.warning(f"Non-PDF content type: {content_type}")
+                return None
+
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                if int(content_length) > 50_000_000:
+                    return None
+
+            return response.content
+
+        except requests.exceptions.HTTPError:
+            status = getattr(response, "status_code", None)
+            if status in (401, 403, 404):
+                return None
+        except Exception:
+            pass
+
+        if attempt < retries:
+            time.sleep(2 ** attempt)
+
+    return None
+
+# ------------------------------------------------------------
+# TOOL: SEARCH
 # ------------------------------------------------------------
 @mcp.tool()
 async def search_adams(
@@ -334,395 +333,351 @@ async def search_adams(
     use_google: bool = False,
     filters: Optional[Dict[str, Any]] = None,
     sort_by: str = "score",
-    sort_desc: bool = True
+    sort_desc: bool = True,
+    docket_number: Optional[str] = None,
+    document_type: Optional[str] = None,
+    days_back: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Search NRC ADAMS database and optionally Google.
-    
-    Args:
-        query: Search query string
-        top_n: Number of results to return (default: 5)
-        max_results: Override for top_n
-        max_pages: Number of pages to search (default: 1)
-        use_google: Whether to include Google search results (default: False)
-        filters: Dictionary of filters to apply:
-            - document_type: str or List[str] - Filter by document type(s)
-            - min_score: float - Minimum relevance score
-            - source: str - Filter by source (ADAMS or Google)
-            - date_from: str - Filter documents from this date (YYYY-MM-DD)
-            - date_to: str - Filter documents to this date (YYYY-MM-DD)
-        sort_by: Field to sort by (default: "score")
-        sort_desc: Sort in descending order (default: True)
-    
-    Returns:
-        Dictionary with results or error
+    Search NRC ADAMS via adams_client_v5 (APS REST API).
+
+    Legacy behavior:
+      - legacy_lib is auto-enabled ONLY if query implies a year < 1999
+        (e.g., "1990-1995" or "1992").
     """
     search_logger.info(f"Search request: query='{query}', top_n={top_n}, filters={filters}")
-    
-    # Validate query
+
     is_valid, error_msg = validate_query(query)
     if not is_valid:
-        search_logger.error(f"Invalid query: {error_msg}")
         return {"error": error_msg, "query": query}
 
     if max_results is not None:
         top_n = max_results
 
+    # auto legacy only when query implies pre-1999
+    legacy_lib = query_implies_pre_1999(query)
+
+    # Build API filters (push date constraints into API)
+    api_filters = build_api_filters_from_inputs(
+        query=query,
+        docket_number=docket_number,
+        document_type=document_type,
+        days_back=days_back,
+        user_filters=filters,
+    )
+
     try:
-        # Search ADAMS
         rate_limiter.wait()
-        search_logger.info(f"Searching ADAMS with query: {query}")
-        
-        adams_docs = client.search(query, max_pages=max_pages)
-        search_logger.info(f"ADAMS returned {len(adams_docs)} documents")
 
-        results = []
-        for doc in adams_docs:
-            try:
-                result = {
-                    "title": doc.title,
-                    "accession_number": doc.accession_number,
-                    "document_type": getattr(doc, "document_type", None),
-                    "date": getattr(doc, "document_date", None),
-                    "source": "ADAMS",
-                    "score": score_relevance(query, doc.title, getattr(doc, "document_type", None)),
-                    "rationale": "Matched ADAMS index"
-                }
-                results.append(result)
-            except Exception as e:
-                search_logger.warning(f"Error processing ADAMS document: {e}")
-                continue
+        # Pull extra for dedupe/post-filtering
+        api_docs: List[AdamsDocument] = client.search(
+            query=query,
+            filters=api_filters if api_filters else None,
+            max_results=max(top_n * 3, 25),
+            max_pages=max_pages,
+            legacy_lib=legacy_lib,
+        )
 
-        # Google search if requested
+        results: List[Dict[str, Any]] = []
+        for doc in api_docs:
+            results.append({
+                "title": doc.title,
+                "accession_number": doc.accession_number,
+                "document_type": doc.document_type,
+                "document_date": doc.document_date,
+                "added_date": doc.added_date,
+                "docket_number": doc.docket_number,
+                "author_name": doc.author_name,
+                "url": doc.get_download_url(),
+                "source": "ADAMS API",
+                "score": score_relevance(query, doc.title, doc.document_type),
+                "rationale": "Matched ADAMS API"
+            })
+
+        # Optional Google (kept)
         if use_google:
             if not (GOOGLE_API_KEY and GOOGLE_CX):
-                error_msg = "Google search requested but API key/CX not configured"
-                search_logger.error(error_msg)
-                return {"error": error_msg}
+                return {"error": "Google search requested but API key/CX not configured"}
 
-            try:
-                rate_limiter.wait()
-                search_query = f"site:pbadupws.nrc.gov {query}"
-                search_logger.info(f"Searching Google: {search_query}")
-                
-                google_hits = client.google_search(search_query, num=top_n)
-                search_logger.info(f"Google returned {len(google_hits)} results")
-
-                for g in google_hits:
-                    try:
-                        result = {
-                            "title": g.get("title"),
-                            "link": g.get("link"),
-                            "snippet": g.get("snippet"),
-                            "source": "Google",
-                            "score": score_relevance(query, g.get("title"), None),
-                            "rationale": "Google NRC domain result"
-                        }
-                        results.append(result)
-                    except Exception as e:
-                        search_logger.warning(f"Error processing Google result: {e}")
-                        continue
-                        
-            except Exception as e:
-                search_logger.error(f"Google search failed: {e}")
-                # Continue with ADAMS results only
+            rate_limiter.wait()
+            # Better targeting for ADAMS PDFs
+            search_query = f"site:pbadupws.nrc.gov {query}"
+            google_hits = client.google_search(search_query, num=min(top_n, 10))
+            for g in google_hits:
+                results.append({
+                    "title": g.get("title"),
+                    "link": g.get("link"),
+                    "snippet": g.get("snippet"),
+                    "source": "Google",
+                    "score": score_relevance(query, g.get("title"), None),
+                    "rationale": "Google NRC ADAMS domain result"
+                })
 
         # Deduplicate
         seen = set()
         deduped = []
         for r in results:
-            try:
-                fp = fingerprint_result(r)
-                if fp in seen:
-                    continue
-                seen.add(fp)
-                deduped.append(r)
-            except Exception as e:
-                search_logger.warning(f"Error deduplicating result: {e}")
+            fp = fingerprint_result(r)
+            if fp in seen:
                 continue
-        
-        search_logger.info(f"After deduplication: {len(deduped)} results")
+            seen.add(fp)
+            deduped.append(r)
 
-        # Apply filters
-        if filters:
-            try:
-                deduped = apply_filters(deduped, filters)
-            except Exception as e:
-                search_logger.error(f"Error applying filters: {e}")
-                return {"error": f"Filter error: {str(e)}", "results": deduped}
+        # Post-filters (min_score etc.)
+        deduped = apply_post_filters(deduped, filters)
 
-        # Sort
-        try:
-            deduped.sort(
-                key=lambda r: r.get(sort_by, 0),
-                reverse=sort_desc
-            )
-        except Exception as e:
-            search_logger.warning(f"Error sorting results: {e}")
+        # Safe sort
+        sort_field_map = {
+            "score": "score",
+            "title": "title",
+            "document_date": "document_date",
+            "added_date": "added_date",
+        }
+        sort_field = sort_field_map.get(sort_by, "score")
+        deduped.sort(key=lambda r: r.get(sort_field, "") if sort_field != "score" else r.get("score", 0), reverse=sort_desc)
 
         final_results = deduped[:top_n]
-        search_logger.info(f"Returning {len(final_results)} results")
-        
         return {
             "results": final_results,
-            "total_found": len(results),
-            "after_dedup": len(deduped),
             "returned": len(final_results),
-            "filters_applied": filters is not None
+            "after_dedup": len(deduped),
+            "api_filters_applied": len(api_filters),
+            "legacy_lib_used": legacy_lib,
         }
 
+    except AdamsAPIError as e:
+        search_logger.error(f"ADAMS API error: {e}")
+        return {"error": f"ADAMS API error: {str(e)}", "query": query}
     except Exception as e:
-        search_logger.exception(f"Search failed with unexpected error: {e}")
+        search_logger.exception("Unexpected search failure")
         return {"error": f"Search failed: {str(e)}", "query": query}
 
-# Tool - Download 
+# ------------------------------------------------------------
+# TOOL: GET DOCUMENT
 # ------------------------------------------------------------
 @mcp.tool()
-async def download_adams(accession_number: str) -> Dict[str, Any]:
+async def get_document(accession_number: str) -> Dict[str, Any]:
     """
-    Download a document from ADAMS by accession number.
-    Args:
-        accession_number: The ADAMS accession number (e.g., ML12345A678)
-    Returns:
-        Dictionary with status, path, and URL or error message
+    Retrieve document metadata from ADAMS by accession number.
     """
-    download_logger.info(f"Download request: {accession_number}")
-    
-    # Validate accession number
+    download_logger.info(f"Get document request: {accession_number}")
+
     is_valid, error_msg = validate_accession_number(accession_number)
     if not is_valid:
-        download_logger.error(f"Invalid accession number: {error_msg}")
         return {"error": error_msg, "accession_number": accession_number}
 
     try:
-        folder = accession_number[:6]
-        url = f"https://pbadupws.nrc.gov/docs/{folder}/{accession_number}.pdf"
-        dest = get_downloads_folder() / f"{accession_number}.pdf"
-        
-        download_logger.info(f"Downloading from: {url}")
-        download_logger.info(f"Saving to: {dest}")
+        rate_limiter.wait()
+        doc = client.get_document(accession_number)
 
-        pdf = fetch_pdf(url)
-        if not pdf:
-            error_msg = "Failed to fetch valid PDF"
-            download_logger.error(error_msg)
-            return {
-                "error": error_msg,
-                "url": url,
-                "accession_number": accession_number
-            }
+        if not doc:
+            return {"error": "Document not found", "accession_number": accession_number}
 
-        dest.write_bytes(pdf)
-        download_logger.info(f"Successfully saved PDF: {dest}")
-        
         return {
             "status": "success",
-            "path": str(dest),
-            "url": url,
-            "size_bytes": len(pdf),
-            "accession_number": accession_number
+            "accession_number": doc.accession_number,
+            "title": doc.title,
+            "document_date": doc.document_date,
+            "added_date": doc.added_date,
+            "document_type": doc.document_type,
+            "author_name": doc.author_name,
+            "author_affiliation": doc.author_affiliation,
+            "docket_number": doc.docket_number,
+            "license_number": doc.license_number,
+            "page_count": doc.page_count,
+            "url": doc.get_download_url(),
+            "keywords": doc.keywords,
+            "is_legacy": doc.is_legacy,
+            "is_package": doc.is_package,
         }
 
-    except DownloadError as e:
-        download_logger.error(f"Download error: {e}")
-        return {"error": str(e), "accession_number": accession_number}
+    except AdamsAPIError as e:
+        download_logger.error(f"ADAMS API error: {e}")
+        return {"error": f"ADAMS API error: {str(e)}", "accession_number": accession_number}
     except Exception as e:
-        download_logger.exception(f"Unexpected error during download: {e}")
-        return {
-            "error": f"Download failed: {str(e)}",
-            "accession_number": accession_number
-        }
+        download_logger.exception("Unexpected get_document failure")
+        return {"error": f"Failed: {str(e)}", "accession_number": accession_number}
 
-# Tool - Batch Download
+# ------------------------------------------------------------
+# TOOL: DOWNLOAD SINGLE (API URL first)
+# ------------------------------------------------------------
+@mcp.tool()
+async def download_adams(accession_number: str) -> Dict[str, Any]:
+    download_logger.info(f"Download request: {accession_number}")
+
+    is_valid, error_msg = validate_accession_number(accession_number)
+    if not is_valid:
+        return {"error": error_msg, "accession_number": accession_number}
+
+    accession_number = accession_number.strip().upper()
+    dest = get_downloads_folder() / f"{accession_number}.pdf"
+
+    try:
+        # 1) Use API to get canonical URL
+        rate_limiter.wait()
+        doc = client.get_document(accession_number)
+        url = doc.get_download_url() if doc else None
+
+        # 2) Fallback patterns (only if needed)
+        folder = accession_number[:6]
+        urls_to_try = [u for u in [
+            url,
+            f"https://www.nrc.gov/docs/{folder}/{accession_number}.pdf",
+            f"https://pbadupws.nrc.gov/docs/{folder}/{accession_number}.pdf",
+        ] if u]
+
+        pdf = None
+        used_url = None
+        for u in urls_to_try:
+            pdf = fetch_pdf(u)
+            if pdf:
+                used_url = u
+                break
+
+        if not pdf:
+            return {"error": "Failed to fetch valid PDF", "urls_tried": urls_to_try, "accession_number": accession_number}
+
+        dest.write_bytes(pdf)
+        return {"status": "success", "path": str(dest), "url": used_url, "size_bytes": len(pdf), "accession_number": accession_number}
+
+    except AdamsAPIError as e:
+        return {"error": f"ADAMS API error: {str(e)}", "accession_number": accession_number}
+    except Exception as e:
+        download_logger.exception("Unexpected download failure")
+        return {"error": f"Download failed: {str(e)}", "accession_number": accession_number}
+
+# ------------------------------------------------------------
+# TOOL: BATCH DOWNLOAD (API URL first)
 # ------------------------------------------------------------
 @mcp.tool()
 async def download_adams_batch(accession_numbers: List[str]) -> Dict[str, Any]:
-    """
-    Download multiple documents from ADAMS.
-    Args:
-        accession_numbers: List of ADAMS accession numbers
-    Returns:
-        Dictionary with folder path and results for each download
-    """
-    download_logger.info(f"Batch download request: {len(accession_numbers)} documents")
-    
+    download_logger.info(f"Batch download request: {len(accession_numbers)} docs")
+
     if not accession_numbers:
         return {"error": "No accession numbers provided"}
-    
     if len(accession_numbers) > 50:
         return {"error": "Too many documents requested (max 50)"}
-    
-    folder = get_downloads_folder()
+
+    folder_path = get_downloads_folder()
     results = []
     success_count = 0
     failure_count = 0
 
-    for i, acc in enumerate(accession_numbers, 1):
-        download_logger.info(f"Processing {i}/{len(accession_numbers)}: {acc}")
-        
-        # Validate accession number
+    for acc in accession_numbers:
+        acc = (acc or "").strip().upper()
         is_valid, error_msg = validate_accession_number(acc)
         if not is_valid:
-            download_logger.warning(f"Invalid accession number {acc}: {error_msg}")
-            results.append({
-                "accession": acc,
-                "status": "invalid",
-                "error": error_msg
-            })
+            results.append({"accession": acc, "status": "invalid", "error": error_msg})
             failure_count += 1
             continue
 
         try:
-            url = f"https://pbadupws.nrc.gov/docs/{acc[:6]}/{acc}.pdf"
-            dest = folder / f"{acc}.pdf"
+            rate_limiter.wait()
+            doc = client.get_document(acc)
+            url = doc.get_download_url() if doc else None
 
-            pdf = fetch_pdf(url)
-            if pdf:
-                dest.write_bytes(pdf)
-                results.append({
-                    "accession": acc,
-                    "status": "success",
-                    "path": str(dest),
-                    "size_bytes": len(pdf)
-                })
-                success_count += 1
-                download_logger.info(f"Successfully downloaded: {acc}")
-            else:
-                results.append({
-                    "accession": acc,
-                    "status": "failed",
-                    "error": "Could not fetch PDF"
-                })
+            folder = acc[:6]
+            urls_to_try = [u for u in [
+                url,
+                f"https://www.nrc.gov/docs/{folder}/{acc}.pdf",
+                f"https://pbadupws.nrc.gov/docs/{folder}/{acc}.pdf",
+            ] if u]
+
+            pdf = None
+            used_url = None
+            for u in urls_to_try:
+                pdf = fetch_pdf(u)
+                if pdf:
+                    used_url = u
+                    break
+
+            if not pdf:
+                results.append({"accession": acc, "status": "failed", "error": "Could not fetch PDF", "urls_tried": urls_to_try})
                 failure_count += 1
-                download_logger.warning(f"Failed to download: {acc}")
-                
+                continue
+
+            dest = folder_path / f"{acc}.pdf"
+            dest.write_bytes(pdf)
+            results.append({"accession": acc, "status": "success", "path": str(dest), "url": used_url, "size_bytes": len(pdf)})
+            success_count += 1
+
         except Exception as e:
-            download_logger.error(f"Error downloading {acc}: {e}")
-            results.append({
-                "accession": acc,
-                "status": "error",
-                "error": str(e)
-            })
+            results.append({"accession": acc, "status": "error", "error": str(e)})
             failure_count += 1
 
-    download_logger.info(
-        f"Batch download complete: {success_count} success, {failure_count} failed"
-    )
-    
     return {
-        "folder": str(folder),
+        "folder": str(folder_path),
         "total": len(accession_numbers),
         "success": success_count,
         "failed": failure_count,
         "results": results
     }
 
-# Tool - Summarize PDF
 # ------------------------------------------------------------
+# TOOL: SUMMARIZE PDF
+# ------------------------------------------------------------
+def chunk_text(text: str, max_chars: int, chunk_size: int = 1200) -> str:
+    chunks = []
+    total = 0
+    for i in range(0, len(text), chunk_size):
+        chunk = text[i:i + chunk_size]
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= max_chars:
+            break
+    return " ".join(chunks)
+
 @mcp.tool()
 async def summarize_pdf(path: str, max_chars: int = 2000) -> Dict[str, Any]:
-    """
-    Extract and summarize text from a PDF file.
-    Args:
-        path: Path to the PDF file
-        max_chars: Maximum characters to extract (default: 2000)
-    Returns:
-        Dictionary with summary, page count, and character count or error
-    """
     pdf_logger.info(f"PDF summary request: {path}")
-    
-    # Validate path
+
     try:
         path_obj = Path(path).resolve()
         downloads = get_downloads_folder().resolve()
-        
-        # Security check: ensure path is within downloads folder
+
         if not str(path_obj).startswith(str(downloads)):
-            error_msg = "Access denied: path outside ADAMS downloads folder"
-            pdf_logger.error(f"{error_msg}: {path}")
-            return {"error": error_msg, "path": path}
-        
+            return {"error": "Access denied: path outside ADAMS downloads folder", "path": path}
         if not path_obj.exists():
-            error_msg = "File not found"
-            pdf_logger.error(f"{error_msg}: {path}")
-            return {"error": error_msg, "path": path}
-        
+            return {"error": "File not found", "path": path}
         if not path_obj.is_file():
-            error_msg = "Path is not a file"
-            pdf_logger.error(f"{error_msg}: {path}")
-            return {"error": error_msg, "path": path}
-            
+            return {"error": "Path is not a file", "path": path}
     except Exception as e:
-        pdf_logger.error(f"Path validation error: {e}")
         return {"error": f"Invalid path: {str(e)}", "path": path}
 
     try:
-        pdf_logger.info(f"Reading PDF: {path_obj}")
         reader = PdfReader(str(path_obj))
         pages = reader.pages
-        
         if not pages:
-            pdf_logger.warning("PDF has no pages")
-            return {
-                "error": "PDF contains no pages",
-                "path": path,
-                "pages": 0
-            }
-        
-        pdf_logger.info(f"PDF has {len(pages)} pages")
-        texts = []
+            return {"error": "PDF contains no pages", "path": path, "pages": 0}
 
-        # Extract first page
+        texts = []
         try:
-            first_page_text = pages[0].extract_text() or ""
-            texts.append(first_page_text)
-            pdf_logger.info(f"Extracted {len(first_page_text)} chars from first page")
-        except Exception as e:
-            pdf_logger.warning(f"Could not extract text from first page: {e}")
-        
-        # Extract last page if different from first
+            texts.append(pages[0].extract_text() or "")
+        except Exception:
+            pass
+
         if len(pages) > 1:
             try:
-                last_page_text = pages[-1].extract_text() or ""
-                texts.append(last_page_text)
-                pdf_logger.info(f"Extracted {len(last_page_text)} chars from last page")
-            except Exception as e:
-                pdf_logger.warning(f"Could not extract text from last page: {e}")
+                texts.append(pages[-1].extract_text() or "")
+            except Exception:
+                pass
 
-        # Combine and clean text
         text = " ".join(texts)
-        text = " ".join(text.split())  # Normalize whitespace
-        
+        text = " ".join(text.split())
+
         if not text:
-            pdf_logger.warning("No text extracted from PDF")
-            return {
-                "error": "Could not extract text from PDF (may be image-based)",
-                "path": path,
-                "pages": len(pages),
-                "characters": 0
-            }
+            return {"error": "Could not extract text from PDF (may be image-based)", "path": path, "pages": len(pages), "characters": 0}
 
         summary = chunk_text(text, max_chars)
-        
-        pdf_logger.info(f"Successfully summarized PDF: {len(summary)} chars")
-        
-        return {
-            "summary": summary,
-            "pages": len(pages),
-            "characters": len(text),
-            "extracted_chars": len(summary),
-            "path": path
-        }
+        return {"summary": summary, "pages": len(pages), "characters": len(text), "extracted_chars": len(summary), "path": path}
 
     except Exception as e:
-        pdf_logger.exception(f"PDF processing failed: {e}")
-        return {
-            "error": f"Failed to process PDF: {str(e)}",
-            "path": path
-        }
+        pdf_logger.exception("PDF processing failed")
+        return {"error": f"Failed to process PDF: {str(e)}", "path": path}
 
+# ------------------------------------------------------------
+# RUN
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("ADAMS MCP Server running")
-    mcp.run()
-
-
+    logger.info("Starting MCP server (FastMCP legacy API)")
+    mcp.run(transport="stdio")
