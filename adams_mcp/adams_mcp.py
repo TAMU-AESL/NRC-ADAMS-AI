@@ -20,11 +20,9 @@ from pathlib import Path
 from threading import Lock
 from typing import Optional, Dict, List, Any, Tuple
 from datetime import datetime, timedelta
-
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 import requests
-
 from mcp.server.fastmcp import FastMCP
 from adams_client_v5 import AdamsClient, AdamsDocument, AdamsAPIError
 
@@ -107,14 +105,13 @@ def validate_accession_number(accession: str) -> Tuple[bool, Optional[str]]:
     if not isinstance(accession, str):
         return False, "Accession number must be a string"
     accession = accession.strip().upper()
-    if not accession.startswith("ML"):
-        return False, "Accession number must start with 'ML'"
-    if len(accession) < 8:
+    if len(accession) < 6:
         return False, "Accession number is too short"
-    if not re.match(r"^ML[A-Za-z0-9]+$", accession):
+    # Modern accession numbers start with ML; legacy pre-1999 docs use other formats
+    # (e.g. 7500001, 8012345, 9200001) — allow both.
+    if not re.match(r"^[A-Z0-9]+$", accession):
         return False, "Accession number contains invalid characters"
     return True, None
-
 
 def validate_query(query: str) -> Tuple[bool, Optional[str]]:
     if not query or not query.strip():
@@ -131,37 +128,79 @@ def validate_query(query: str) -> Tuple[bool, Optional[str]]:
 def extract_year_range(query: str) -> Optional[Tuple[int, int]]:
     """
     Recognizes:
-      - "1990-1995"
-      - "1990 to 1995"
-      - "from 1990 to 1995"
-      - single year "1992"
+      - "1975-1979", "1975–1979"
+      - "from 1975 to 1979"
+      - single year "1962"
+      - "1950s" (treated as 1950-1959)
     """
     q = query or ""
-    m = re.search(r"(19\d{2}|20\d{2})\s*(?:[-–]|to)\s*(19\d{2}|20\d{2})", q, flags=re.IGNORECASE)
+
+    m = re.search(r"\b(18\d{2}|19\d{2}|20\d{2})\s*(?:[-–]|to)\s*(18\d{2}|19\d{2}|20\d{2})\b", q, flags=re.IGNORECASE)
     if m:
         y1, y2 = int(m.group(1)), int(m.group(2))
         return (min(y1, y2), max(y1, y2))
 
-    m = re.search(r"(19\d{2}|20\d{2})", q)
+    m = re.search(r"\b(18\d{2}|19\d{2}|20\d{2})s\b", q, flags=re.IGNORECASE)
+    if m:
+        decade = int(m.group(1))
+        return (decade, decade + 9)
+
+    m = re.search(r"\b(18\d{2}|19\d{2}|20\d{2})\b", q)
     if m:
         y = int(m.group(1))
         return (y, y)
 
     return None
 
-
 def query_implies_pre_1999(query: str) -> bool:
     yr = extract_year_range(query)
-    if not yr:
-        return False
-    start_y, _ = yr
-    return start_y < 1999
+    if yr:
+        # Any query touching a year before 2000 needs legacy lib
+        return yr[0] < 2000
 
+    q = (query or "").lower()
+    # Natural-language era triggers including decade shorthand (seventies, eighties, etc.)
+    return bool(re.search(
+        r"\b(pre|before)\s*[- ]?(?:19)?99\b"
+        r"|\blegacy\b|\bpre-?adams\b"
+        r"|\b(?:seventies|eighties|nineties)\b"
+        r"|\b(?:19[6-9]\d)s?\b",
+        q,
+    ))
 
 def year_range_to_dates(year_range: Tuple[int, int]) -> Tuple[str, str]:
     start_y, end_y = year_range
     return f"{start_y:04d}-01-01", f"{end_y:04d}-12-31"
 
+def strip_year_tokens(q: str) -> str:
+    """
+    Remove year references from the query so date filters
+    control the time constraint instead of full-text search.
+    """
+    q = re.sub(
+        r"\b(18\d{2}|19\d{2}|20\d{2})\s*(?:[-–]|to)\s*(18\d{2}|19\d{2}|20\d{2})\b",
+        " ",
+        q,
+        flags=re.IGNORECASE,
+    )
+    q = re.sub(r"\b(18\d{2}|19\d{2}|20\d{2})s\b", " ", q, flags=re.IGNORECASE)
+    q = re.sub(r"\b(18\d{2}|19\d{2}|20\d{2})\b", " ", q)
+    return re.sub(r"\s+", " ", q).strip()
+
+def _drop_documentdate_filters(filters: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+    """
+    Legacy results often can't satisfy DocumentDate range filters because DocumentDate is unknown.
+    Removing those filters prevents legacy starvation.
+    """
+    if not filters:
+        return filters
+    kept = []
+    for f in filters:
+        field = str(f.get("field", "")).lower()
+        if field == "documentdate":
+            continue
+        kept.append(f)
+    return kept
 
 def build_api_filters_from_inputs(
     *,
@@ -248,7 +287,6 @@ def score_relevance(query: str, title: Optional[str], doc_type: Optional[str]) -
             score += 1.0
 
     return round(score, 2)
-
 
 def fingerprint_result(item: dict) -> str:
     if item.get("accession_number"):
@@ -354,29 +392,95 @@ async def search_adams(
     if max_results is not None:
         top_n = max_results
 
-    # auto legacy only when query implies pre-1999
-    legacy_lib = query_implies_pre_1999(query)
+ # ------------------------------------------------------------
+    # Detect year range and control library selection
+    # ------------------------------------------------------------
+    yr: Optional[Tuple[int, int]] = extract_year_range(query)
 
+    # Default behavior
+    legacy_lib = query_implies_pre_1999(query)
+    main_lib = True
+
+    # If year range explicitly detected, allow both (website-like behavior)
+    if yr:
+        start_y, end_y = yr
+        if end_y < 1999:
+            main_lib = True
+            legacy_lib = True
+        elif start_y < 1999 <= end_y:
+            main_lib = True
+            legacy_lib = True
+        else:
+            # fully post-1999: main only
+            main_lib = True
+            legacy_lib = False
+
+    # ------------------------------------------------------------
+    # Strip year tokens from the full-text portion of the query
+    # ------------------------------------------------------------
+    clean_query = strip_year_tokens(query) if yr else query
+    has_terms = bool(clean_query.strip())
+
+    # If stripping leaves nothing (e.g., "1990-1998"), don't send empty query to API.
+    # Use a broad token that tends to match widely.
+    q_api = clean_query if has_terms else "a"
+
+    # ------------------------------------------------------------
     # Build API filters (push date constraints into API)
+    # ------------------------------------------------------------
     api_filters = build_api_filters_from_inputs(
-        query=query,
+        query=clean_query if has_terms else "",  # many implementations ignore query here anyway
         docket_number=docket_number,
         document_type=document_type,
         days_back=days_back,
         user_filters=filters,
     )
 
+    # Sort choice: if the user gave a year, sorting by DocumentDate makes sense.
+    api_sort = "DocumentDate" if (yr or sort_by == "document_date") else "DateAddedTimestamp"
+    api_sort_dir = 1 if sort_desc else 0  # your client uses 1=desc, 0=asc
+
     try:
         rate_limiter.wait()
 
-        # Pull extra for dedupe/post-filtering
-        api_docs: List[AdamsDocument] = client.search(
-            query=query,
-            filters=api_filters if api_filters else None,
-            max_results=max(top_n * 3, 25),
-            max_pages=max_pages,
-            legacy_lib=legacy_lib,
-        )
+        # ------------------------------------------------------------
+        # Two-pass search prevents legacy starvation:
+        #   PASS 1 (main): apply filters as-is
+        #   PASS 2 (legacy): if yr, drop DocumentDate filters
+        # ------------------------------------------------------------
+        api_docs: List[AdamsDocument] = []
+
+        # PASS 1: main library
+        if main_lib:
+            docs_main = client.search(
+                query=q_api,
+                filters=api_filters if api_filters else None,
+                max_results=max(top_n * 5, 50),
+                max_pages=max_pages,
+                main_lib=True,
+                legacy_lib=False,
+                sort=api_sort,
+                sort_direction=api_sort_dir,
+            )
+            api_docs.extend(docs_main)
+
+        # PASS 2: legacy library (remove DocumentDate filters when year-range requested)
+        if legacy_lib:
+            legacy_filters = api_filters if api_filters else None
+            if yr and legacy_filters:
+                legacy_filters = _drop_documentdate_filters(legacy_filters)
+
+            docs_legacy = client.search(
+                query=q_api,
+                filters=legacy_filters if legacy_filters else None,
+                max_results=max(top_n * 5, 50),
+                max_pages=max_pages,
+                main_lib=False,
+                legacy_lib=True,
+                sort=api_sort,
+                sort_direction=api_sort_dir,
+            )
+            api_docs.extend(docs_legacy)
 
         results: List[Dict[str, Any]] = []
         for doc in api_docs:
@@ -393,6 +497,40 @@ async def search_adams(
                 "score": score_relevance(query, doc.title, doc.document_type),
                 "rationale": "Matched ADAMS API"
             })
+
+        # ------------------------------------------------------------
+        # Handle legacy "unknown date" records (stored as 1900-01-01)
+        # For pre-2000 queries the legacy library often has NO DocumentDate,
+        # so we must NOT drop those results — they're the whole point.
+        # ------------------------------------------------------------
+        if yr:
+            before = len(results)
+
+            def _is_unknown_date(r: Dict[str, Any]) -> bool:
+                d = (r.get("document_date") or "").strip()
+                return d == "1900-01-01" or d.startswith("1900-01-01")
+
+            non_unknown = [r for r in results if not _is_unknown_date(r)]
+            unknown_docs = [r for r in results if _is_unknown_date(r)]
+
+            if not legacy_lib:
+                # Post-1999 query: safe to drop sentinel dates
+                results = non_unknown
+            elif non_unknown:
+                # We have real-dated results — prefer those but keep unknowns as supplement
+                results = non_unknown + unknown_docs
+            else:
+                # Only legacy results with unknown dates — keep all of them;
+                # dropping them would leave the user with nothing.
+                results = unknown_docs
+
+            search_logger.info(
+                "Year-range query: %d unknown-date results (1900-01-01); "
+                "non_unknown=%d; final=%d",
+                len(unknown_docs),
+                len(non_unknown),
+                len(results),
+            )
 
         # Optional Google (kept)
         if use_google:
@@ -443,6 +581,9 @@ async def search_adams(
             "after_dedup": len(deduped),
             "api_filters_applied": len(api_filters),
             "legacy_lib_used": legacy_lib,
+            "main_lib_used": main_lib,
+            "year_range_detected": yr,
+            "query_used": clean_query,
         }
 
     except AdamsAPIError as e:
@@ -520,10 +661,14 @@ async def download_adams(accession_number: str) -> Dict[str, Any]:
 
         # 2) Fallback patterns (only if needed)
         folder = accession_number[:6]
+        legacy_folder = accession_number[:4] if not accession_number.startswith("ML") else None
         urls_to_try = [u for u in [
             url,
             f"https://www.nrc.gov/docs/{folder}/{accession_number}.pdf",
             f"https://pbadupws.nrc.gov/docs/{folder}/{accession_number}.pdf",
+            # Legacy pre-1999 public document server
+            f"https://www.nrc.gov/reading-rm/doc-collections/ACRS/old-reports/{accession_number}.pdf" if not accession_number.startswith("ML") else None,
+            f"https://www.nrc.gov/docs/{legacy_folder}/{accession_number}.pdf" if legacy_folder else None,
         ] if u]
 
         pdf = None
@@ -577,10 +722,13 @@ async def download_adams_batch(accession_numbers: List[str]) -> Dict[str, Any]:
             url = doc.get_download_url() if doc else None
 
             folder = acc[:6]
+            legacy_folder = acc[:4] if not acc.startswith("ML") else None
             urls_to_try = [u for u in [
                 url,
                 f"https://www.nrc.gov/docs/{folder}/{acc}.pdf",
                 f"https://pbadupws.nrc.gov/docs/{folder}/{acc}.pdf",
+                f"https://www.nrc.gov/reading-rm/doc-collections/ACRS/old-reports/{acc}.pdf" if not acc.startswith("ML") else None,
+                f"https://www.nrc.gov/docs/{legacy_folder}/{acc}.pdf" if legacy_folder else None,
             ] if u]
 
             pdf = None
