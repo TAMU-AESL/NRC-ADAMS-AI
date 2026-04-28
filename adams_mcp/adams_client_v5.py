@@ -1,64 +1,62 @@
 """
-ADAMS Client v5 - New REST API Integration
+ADAMS Client v5 - NRC ADAMS Public Search API (APS REST)
 
-This client uses the new NRC ADAMS Public Search API (https://adams-api.nrc.gov)
-which replaced the legacy XML-based API.
-
-API Documentation: https://adams-api-developer.nrc.gov/
-Developer Guide: APS-API-Guide.pdf
 As of right now, utilize Claude Desktop with the MCP setup to run this code.
 To utilize your API key, set the ADAMS_API_KEY environment variable in the MCP config. This can be added under your PYTHONPATH variable.
+Google Search should be able to be utilized via your own Google API & Google Search Engine Keys also in the config files, if you so wish.
 
-Key Changes from v4:
-- JSON-based REST API instead of XML
-- Subscription key authentication (Ocp-Apim-Subscription-Key header)
-- POST /aps/api/search for searching
-- GET /aps/api/search/{accessionNumber} for single document retrieval
-- New filter format with field, value, operator structure
-- Date filters use OData-style expressions
+API Docs:  https://adams-api-developer.nrc.gov/
+Endpoints:
+  POST /aps/api/search              – search
+  GET  /aps/api/search/{accession}  – single document
 
-Author: TAMU-AESL
-Version: 5.0.0
+Auth: Ocp-Apim-Subscription-Key header (set ADAMS_API_KEY env var)
+
+Author: TAMU-AESL  |  Version: 5.1.0
 """
 
-import os
+import hashlib
 import json
 import logging
+import os
 import time
-import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any, Union
+from typing import Any, Dict, List, Optional, Union
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ─────────────────────────────────────────────
-# Logging Setup
-# ─────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ADAMS_CLIENT_V5")
 
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
 class AdamsAPIError(Exception):
-    """Custom exception for errors related to ADAMS API requests or processing."""
-    pass
+    """Raised on ADAMS API request or processing errors."""
 
+# ---------------------------------------------------------------------------
+# Document model
+# ---------------------------------------------------------------------------
 
 class AdamsDocument:
-    """
-    Represents a document record returned by an ADAMS search.
+    """A single document record returned by ADAMS."""
 
-    Updated for the new API response format which uses different field names
-    and returns arrays for multi-value fields.
-    """
+    # Fields that the API may return as lists
+    _LIST_FIELDS = (
+        "document_type", "author_name", "author_affiliation",
+        "addressee_name", "addressee_affiliation",
+        "docket_number", "license_number", "document_report_number", "keywords",
+    )
 
     def __init__(
         self,
         title: str = None,
         accession_number: str = None,
         document_date: str = None,
-        added_date: str = None,  # DateAddedTimestamp in new API
+        added_date: str = None,
         document_type: Union[str, List[str]] = None,
         author_name: Union[str, List[str]] = None,
         author_affiliation: Union[str, List[str]] = None,
@@ -70,10 +68,8 @@ class AdamsDocument:
         document_report_number: Union[str, List[str]] = None,
         keywords: Union[str, List[str]] = None,
         page_count: int = None,
-        content_size: int = None,
-        mime_type: str = None,
         uri: str = None,
-        content: str = None,  # New: document content text
+        content: str = None,
         is_package: bool = False,
         is_legacy: bool = False,
         availability: str = None,
@@ -82,88 +78,82 @@ class AdamsDocument:
         self.accession_number = accession_number
         self.document_date = document_date
         self.added_date = added_date
-
-        # Handle list/string fields - normalize to string for compatibility
-        self.document_type = self._join_list(document_type)
-        self.document_types = document_type if isinstance(document_type, list) else [document_type] if document_type else []
-        self.author_name = self._join_list(author_name)
-        self.author_affiliation = self._join_list(author_affiliation)
-        self.addressee_name = self._join_list(addressee_name)
-        self.addressee_affiliation = self._join_list(addressee_affiliation)
-        self.docket_number = self._join_list(docket_number)
-        self.docket_numbers = docket_number if isinstance(docket_number, list) else [docket_number] if docket_number else []
-        self.license_number = self._join_list(license_number)
         self.package_number = package_number
-        self.document_report_number = self._join_list(document_report_number)
-        self.keywords = self._join_list(keywords)
-
-        # Parse numeric fields
-        try:
-            self.page_count = int(page_count) if page_count not in (None, "", "None") else None
-        except (ValueError, TypeError):
-            self.page_count = None
-
-        if content_size is not None and isinstance(content_size, str):
-            try:
-                self.content_size = int(content_size.replace(",", ""))
-            except ValueError:
-                self.content_size = None
-        else:
-            self.content_size = content_size if content_size not in (None, "", "None") else None
-
-        self.mime_type = mime_type
         self.uri = uri
         self.content = content
         self.is_package = is_package
         self.is_legacy = is_legacy
         self.availability = availability
 
+        # Normalize list-or-string fields → joined string + raw list
+        self.document_type = self._join(document_type)
+        self.document_types: List[str] = self._to_list(document_type)
+        self.author_name = self._join(author_name)
+        self.author_affiliation = self._join(author_affiliation)
+        self.addressee_name = self._join(addressee_name)
+        self.addressee_affiliation = self._join(addressee_affiliation)
+        self.docket_number = self._join(docket_number)
+        self.docket_numbers: List[str] = self._to_list(docket_number)
+        self.license_number = self._join(license_number)
+        self.document_report_number = self._join(document_report_number)
+        self.keywords = self._join(keywords)
+
+        try:
+            self.page_count = int(page_count) if page_count not in (None, "", "None") else None
+        except (ValueError, TypeError):
+            self.page_count = None
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def _join_list(value: Union[str, List[str], None], separator: str = ", ") -> Optional[str]:
-        """Join a list into a string, or return the string as-is."""
+    def _join(value: Union[str, List, None], sep: str = ", ") -> Optional[str]:
         if value is None:
             return None
-        if isinstance(value, list):
-            return separator.join(str(v) for v in value if v)
-        return str(value)
+        return sep.join(str(v) for v in value if v) if isinstance(value, list) else str(value)
+
+    @staticmethod
+    def _to_list(value: Union[str, List, None]) -> List[str]:
+        if value is None:
+            return []
+        return value if isinstance(value, list) else [value]
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
 
     @classmethod
-    def from_api_response(cls, doc_data: Dict[str, Any]) -> "AdamsDocument":
-        """
-        Create an AdamsDocument from the new API's document response format.
-
-        The new API returns documents with these field names (case-sensitive):
-        - AccessionNumber, DocumentTitle, DocumentDate, DateAddedTimestamp
-        - DocumentType (array), AuthorName (array), AuthorAffiliation (array)
-        - AddresseeName (array), AddresseeAffiliation (array)
-        - DocketNumber (array), LicenseNumber (array), Keyword (array)
-        - EstimatedPageCount, Url, content, IsPackage, IsLegacy
-        """
+    def from_api_response(cls, data: Dict[str, Any]) -> "AdamsDocument":
+        """Build from the APS API document payload."""
         return cls(
-            title=doc_data.get("DocumentTitle") or doc_data.get("Name"),
-            accession_number=doc_data.get("AccessionNumber"),
-            document_date=doc_data.get("DocumentDate"),
-            added_date=doc_data.get("DateAddedTimestamp") or doc_data.get("DateAdded"),
-            document_type=doc_data.get("DocumentType"),
-            author_name=doc_data.get("AuthorName"),
-            author_affiliation=doc_data.get("AuthorAffiliation"),
-            addressee_name=doc_data.get("AddresseeName"),
-            addressee_affiliation=doc_data.get("AddresseeAffiliation"),
-            docket_number=doc_data.get("DocketNumber"),
-            license_number=doc_data.get("LicenseNumber"),
-            package_number=doc_data.get("PackageNumber"),
-            document_report_number=doc_data.get("DocumentReportNumber"),
-            keywords=doc_data.get("Keyword"),
-            page_count=doc_data.get("EstimatedPageCount"),
-            uri=doc_data.get("Url"),
-            content=doc_data.get("content"),
-            is_package=doc_data.get("IsPackage") == "Yes",
-            is_legacy=doc_data.get("IsLegacy") == "Yes",
-            availability=doc_data.get("Availability"),
+            title=data.get("DocumentTitle") or data.get("Name"),
+            accession_number=data.get("AccessionNumber"),
+            document_date=data.get("DocumentDate"),
+            added_date=data.get("DateAddedTimestamp") or data.get("DateAdded"),
+            document_type=data.get("DocumentType"),
+            author_name=data.get("AuthorName"),
+            author_affiliation=data.get("AuthorAffiliation"),
+            addressee_name=data.get("AddresseeName"),
+            addressee_affiliation=data.get("AddresseeAffiliation"),
+            docket_number=data.get("DocketNumber"),
+            license_number=data.get("LicenseNumber"),
+            package_number=data.get("PackageNumber"),
+            document_report_number=data.get("DocumentReportNumber"),
+            keywords=data.get("Keyword"),
+            page_count=data.get("EstimatedPageCount"),
+            uri=data.get("Url"),
+            content=data.get("content"),
+            is_package=data.get("IsPackage") == "Yes",
+            is_legacy=data.get("IsLegacy") == "Yes",
+            availability=data.get("Availability"),
         )
 
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
     def to_dict(self) -> Dict[str, Any]:
-        """Return the document's metadata as a dictionary."""
         return {
             "title": self.title,
             "accession_number": self.accession_number,
@@ -182,8 +172,6 @@ class AdamsDocument:
             "document_report_number": self.document_report_number,
             "keywords": self.keywords,
             "page_count": self.page_count,
-            "content_size": self.content_size,
-            "mime_type": self.mime_type,
             "uri": self.uri,
             "is_package": self.is_package,
             "is_legacy": self.is_legacy,
@@ -191,303 +179,199 @@ class AdamsDocument:
         }
 
     def to_json(self) -> str:
-        """Return the document as a JSON string."""
         return json.dumps(self.to_dict(), indent=2)
 
+    # ------------------------------------------------------------------
+    # Download helpers
+    # ------------------------------------------------------------------
+
     def get_download_url(self) -> Optional[str]:
-        """Get the download URL for this document."""
         if self.uri:
             return self.uri
         if self.accession_number and self.accession_number.startswith("ML"):
             acc = self.accession_number
-            folder = acc[:6]
-            return f"https://www.nrc.gov/docs/{folder}/{acc}.pdf"
+            return f"https://www.nrc.gov/docs/{acc[:6]}/{acc}.pdf"
         return None
 
     def download(self, directory: str = ".", filename: str = None, skip_existing: bool = True) -> str:
-        """Download the document's file (PDF) to the specified directory."""
+        """Download the PDF to *directory*. Returns the local file path."""
         if not self.accession_number:
-            raise AdamsAPIError("No accession number available; cannot download.")
-
-        download_url = self.get_download_url()
-        if not download_url:
-            raise AdamsAPIError(f"Cannot determine download URL for accession: {self.accession_number}")
+            raise AdamsAPIError("No accession number; cannot download.")
+        url = self.get_download_url()
+        if not url:
+            raise AdamsAPIError(f"Cannot build download URL for {self.accession_number}")
 
         os.makedirs(directory, exist_ok=True)
-        filename = filename or f"{self.accession_number}.pdf"
-        file_path = os.path.join(directory, filename)
+        path = os.path.join(directory, filename or f"{self.accession_number}.pdf")
 
-        if skip_existing and os.path.exists(file_path):
-            logger.debug("Skipping existing file: %s", file_path)
-            return file_path
+        if skip_existing and os.path.exists(path):
+            return path
 
         try:
-            response = requests.get(download_url, stream=True, timeout=30)
-            response.raise_for_status()
-        except requests.RequestException as e:
-            raise AdamsAPIError(f"Download request failed: {e}")
-
-        try:
-            with open(file_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
+            resp = requests.get(url, stream=True, timeout=30)
+            resp.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in resp.iter_content(8192):
                     if chunk:
                         f.write(chunk)
-        except Exception as e:
-            raise AdamsAPIError(f"Error saving file {file_path}: {e}")
+        except requests.RequestException as e:
+            raise AdamsAPIError(f"Download failed: {e}")
 
-        return file_path
+        return path
 
     def __repr__(self):
         return f"<AdamsDocument {self.accession_number or '(no accession)'}>"
 
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
 class AdamsClient:
     """
-    ADAMS Client v5 - New REST API
+    ADAMS REST API client.
 
-    Uses the new NRC ADAMS Public Search API at https://adams-api.nrc.gov
-
-    Features:
-    - JSON-based REST API
-    - Subscription key authentication
-    - Boolean search with filters
-    - Support for main and legacy libraries
-    - Pagination support
-    - Optional Google Custom Search integration
-
-    API Endpoints:
-    - POST /aps/api/search - Search document library
-    - GET /aps/api/search/{accessionNumber} - Get single document
+    Environment variables:
+      ADAMS_API_KEY   – required for API calls
+      GOOGLE_API_KEY  – optional, enables google_search()
+      GOOGLE_CX       – optional, Google Custom Search Engine ID
     """
 
-    # API Configuration
-    DEFAULT_BASE_URL = "https://adams-api.nrc.gov/aps/api/search"
-    DEFAULT_TIMEOUT = 60
-    DEFAULT_PAGE_SIZE = 100  # API maximum per request
-
-    # Filter operators (from API guide)
-    OPERATORS = {
-        "contains": "contains",
-        "not_contains": "notcontains",
-        "starts": "starts",
-        "not_starts": "notstarts",
-        "equals": "equals",
-        "not_equals": "notequals",
-    }
+    BASE_URL = "https://adams-api.nrc.gov/aps/api/search"
+    GOOGLE_URL = "https://www.googleapis.com/customsearch/v1"
+    PAGE_SIZE = 100   # API max per page
+    TIMEOUT = 60
 
     def __init__(
         self,
         api_key: str = None,
-        base_url: str = None,
-        debug: bool = False,
         google_api_key: str = None,
         google_cx: str = None,
+        base_url: str = None,
+        debug: bool = False,
         timeout: int = None,
     ):
-        """
-        Initialize the ADAMS Client.
-
-        Args:
-            api_key: ADAMS API subscription key (required for API calls).
-                     Can also be set via ADAMS_API_KEY environment variable.
-            base_url: Override the default API base URL.
-            debug: Enable debug logging.
-            google_api_key: Google Custom Search API key (optional).
-            google_cx: Google Custom Search Engine ID (optional).
-            timeout: Request timeout in seconds.
-        """
         self.api_key = api_key or os.environ.get("ADAMS_API_KEY")
-        self.base_url = base_url or self.DEFAULT_BASE_URL
-        self.debug = debug
-        self.timeout = timeout or self.DEFAULT_TIMEOUT
-
-        # Google API configuration
         self.google_api_key = google_api_key or os.environ.get("GOOGLE_API_KEY")
         self.google_cx = google_cx or os.environ.get("GOOGLE_CX")
-        self.google_base_url = "https://www.googleapis.com/customsearch/v1"
+        self.base_url = base_url or self.BASE_URL
+        self.timeout = timeout or self.TIMEOUT
 
-        # Session with retry strategy
-        self.session = requests.Session()
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "POST"],
-        )
-        self.session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
-
-        # Cache for search results
-        self._cache: Dict[str, tuple] = {}
-        self._cache_ttl = 300  # 5 minutes
-
-        # Last search metadata
-        self._last_search: Dict[str, Any] = {}
-
-        if self.debug:
+        if debug:
             logger.setLevel(logging.DEBUG)
 
-    def _get_headers(self) -> Dict[str, str]:
-        """Get the required headers for API requests."""
+        self.session = requests.Session()
+        retry = Retry(total=3, backoff_factor=1,
+                      status_forcelist=[429, 500, 502, 503, 504],
+                      allowed_methods=["GET", "POST"])
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+
+        self._cache: Dict[str, tuple] = {}
+        self._cache_ttl = 300  # seconds
+        self.last_search: Dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # Filter builders (static, re-usable by MCP layer too)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def text_filter(field: str, value: str, operator: str = "contains") -> Dict[str, str]:
+        """
+        Build a text filter.  operator: contains | notcontains | starts |
+        notstarts | equals | notequals
+        """
+        return {"field": field, "value": value, "operator": operator}
+
+    @staticmethod
+    def date_filter(field: str, op: str, date: str) -> Dict[str, str]:
+        """
+        Build a single-bound date filter.
+        op: "ge" (≥), "le" (≤), "eq" (=)
+        date: YYYY-MM-DD
+        """
+        return {"field": field, "value": f"({field} {op} '{date}')"}
+
+    @staticmethod
+    def date_range_filter(field: str, start: str, end: str) -> Dict[str, str]:
+        """Build a date-range filter (ge start AND le end)."""
+        return {"field": field,
+                "value": f"({field} ge '{start}') and ({field} le '{end}')"}
+
+    # Aliases kept for back-compat
+    build_text_filter = text_filter
+    build_date_filter = date_filter
+    build_date_range_filter = date_range_filter
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def _headers(self) -> Dict[str, str]:
         if not self.api_key:
             raise AdamsAPIError(
-                "ADAMS API key not configured. "
-                "Set api_key parameter or ADAMS_API_KEY environment variable."
-            )
+                "ADAMS API key not set. Pass api_key= or set ADAMS_API_KEY.")
         return {
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Ocp-Apim-Subscription-Key": self.api_key,
         }
 
-    # ─────────────────────────────────────────────
-    # Cache Helpers
-    # ─────────────────────────────────────────────
-
-    def _make_cache_key(self, prefix: str, **kwargs) -> str:
-        """Create a stable hashed key from kwargs."""
-        raw = prefix + json.dumps(kwargs, sort_keys=True, default=str)
+    def _cache_key(self, **kwargs) -> str:
+        raw = json.dumps(kwargs, sort_keys=True, default=str)
         return hashlib.sha256(raw.encode()).hexdigest()
 
-    def _get_cache(self, key: str) -> Optional[Any]:
-        """Get a cached value if not expired."""
+    def _from_cache(self, key: str) -> Optional[Any]:
         entry = self._cache.get(key)
         if not entry:
             return None
-        value, expiry = entry
-        if time.time() > expiry:
+        value, exp = entry
+        if time.time() > exp:
             del self._cache[key]
             return None
         return value
 
-    def _set_cache(self, key: str, value: Any) -> None:
-        """Set a cache entry with TTL."""
-        expiry = time.time() + self._cache_ttl
-        self._cache[key] = (value, expiry)
+    def _to_cache(self, key: str, value: Any) -> None:
+        self._cache[key] = (value, time.time() + self._cache_ttl)
 
-    # ─────────────────────────────────────────────
-    # Filtering
-    # ─────────────────────────────────────────────
-
-    @staticmethod
-    def build_text_filter(field: str, value: str, operator: str = "contains") -> Dict[str, str]:
-        """
-        Build a text filter object for the search API.
-
-        Args:
-            field: Field name (e.g., "DocumentType", "DocketNumber")
-            value: Value to match
-            operator: One of: contains, notcontains, starts, notstarts, equals, notequals
-
-        Returns:
-            Filter object for the API request
-        """
-        return {
-            "field": field,
-            "value": value,
-            "operator": operator,
-        }
-
-    @staticmethod
-    def build_date_filter(field: str, operator: str, date: str) -> Dict[str, str]:
-        """
-        Build a date filter object for the search API.
-
-        Args:
-            field: Date field name ("DocumentDate" or "DateAddedTimestamp")
-            operator: One of: "ge" (on or after), "le" (on or before), "eq" (equals)
-            date: Date in YYYY-MM-DD format
-
-        Returns:
-            Filter object for the API request
-
-        Example:
-            build_date_filter("DocumentDate", "ge", "2024-01-01")
-            -> {"field": "DocumentDate", "value": "(DocumentDate ge '2024-01-01')"}
-        """
-        return {
-            "field": field,
-            "value": f"({field} {operator} '{date}')",
-        }
-
-    @staticmethod
-    def build_date_range_filter(field: str, start_date: str, end_date: str) -> Dict[str, str]:
-        """
-        Build a date range (between) filter.
-
-        Args:
-            field: Date field name
-            start_date: Start date in YYYY-MM-DD format
-            end_date: End date in YYYY-MM-DD format
-
-        Returns:
-            Filter object for the API request
-        """
-        return {
-            "field": field,
-            "value": f"({field} ge '{start_date}') and ({field} le '{end_date}')",
-        }
-
-    # ─────────────────────────────────────────────
-    # Search API
-    # ─────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Core search
+    # ------------------------------------------------------------------
 
     def search(
         self,
         query: str = "",
-        filters: List[Dict[str, str]] = None,
-        any_filters: List[Dict[str, str]] = None,
+        filters: List[Dict] = None,
+        any_filters: List[Dict] = None,
         main_lib: bool = True,
         legacy_lib: bool = False,
         sort: str = "DateAddedTimestamp",
-        sort_direction: int = 1,  # 0 = ascending, 1 = descending
+        sort_direction: int = 1,   # 1 = desc, 0 = asc
         max_results: int = 100,
         max_pages: int = 10,
         use_cache: bool = True,
     ) -> List[AdamsDocument]:
         """
-        Search the ADAMS document library.
-
-        Args:
-            query: Search query text (searches content and properties)
-            filters: List of filter objects (AND logic - all must match)
-            any_filters: List of filter objects (OR logic - any can match)
-            main_lib: Include main library (documents since Nov 1999)
-            legacy_lib: Include legacy library (pre-Nov 1999)
-            sort: Field to sort by (e.g., "DateAddedTimestamp", "DocumentDate")
-            sort_direction: 0 = ascending, 1 = descending
-            max_results: Maximum total results to return
-            max_pages: Maximum pages to fetch (API returns up to 100 per page)
-            use_cache: Whether to use cached results
-
-        Returns:
-            List of AdamsDocument objects
+        Search ADAMS.  Returns up to *max_results* AdamsDocument objects.
+        Paginates automatically up to *max_pages*.
         """
         filters = filters or []
         any_filters = any_filters or []
 
-        # Check cache
+        cache_key = self._cache_key(
+            query=query, filters=filters, any_filters=any_filters,
+            main_lib=main_lib, legacy_lib=legacy_lib,
+            sort=sort, sort_direction=sort_direction, max_results=max_results,
+        )
         if use_cache:
-            cache_key = self._make_cache_key(
-                "search",
-                query=query,
-                filters=filters,
-                any_filters=any_filters,
-                main_lib=main_lib,
-                legacy_lib=legacy_lib,
-                sort=sort,
-                sort_direction=sort_direction,
-                max_results=max_results,
-            )
-            cached = self._get_cache(cache_key)
+            cached = self._from_cache(cache_key)
             if cached is not None:
-                logger.info("[search] Cache hit")
+                logger.debug("[search] cache hit")
                 return cached
 
-        headers = self._get_headers()
-        all_documents = []
+        docs: List[AdamsDocument] = []
         skip = 0
 
         for page in range(max_pages):
-            # Build request payload
             payload = {
                 "q": query,
                 "filters": filters,
@@ -498,465 +382,169 @@ class AdamsClient:
                 "sortDirection": sort_direction,
                 "skip": skip,
             }
-
-            if self.debug:
-                logger.debug(f"[search] Page {page + 1}, payload: {json.dumps(payload, indent=2)}")
+            logger.debug("[search] page %d payload: %s", page + 1, payload)
 
             try:
-                response = self.session.post(
-                    self.base_url,
-                    headers=headers,
-                    json=payload,
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
+                resp = self.session.post(
+                    self.base_url, headers=self._headers,
+                    json=payload, timeout=self.timeout)
+                resp.raise_for_status()
             except requests.exceptions.Timeout:
-                raise AdamsAPIError(f"Request timeout after {self.timeout}s")
+                raise AdamsAPIError(f"Request timed out after {self.timeout}s")
             except requests.exceptions.HTTPError as e:
-                error_msg = f"HTTP Error: {e}"
+                detail = ""
                 try:
-                    error_detail = response.json()
-                    error_msg += f" - {error_detail}"
+                    detail = resp.json()
                 except Exception:
                     pass
-                raise AdamsAPIError(error_msg)
+                raise AdamsAPIError(f"HTTP {resp.status_code}: {e} {detail}")
             except requests.RequestException as e:
                 raise AdamsAPIError(f"Request failed: {e}")
 
-            # Parse response
-            data = response.json()
-            results = data.get("results", [])
-
+            results = resp.json().get("results", [])
             if not results:
-                logger.debug(f"[search] No more results on page {page + 1}")
                 break
 
-            # Convert to AdamsDocument objects
-            for result in results:
-                doc_data = result.get("document", {})
-                doc = AdamsDocument.from_api_response(doc_data)
-                all_documents.append(doc)
-
-                if len(all_documents) >= max_results:
+            for r in results:
+                docs.append(AdamsDocument.from_api_response(r.get("document", {})))
+                if len(docs) >= max_results:
                     break
 
-            if len(all_documents) >= max_results:
+            if len(docs) >= max_results or len(results) < self.PAGE_SIZE:
                 break
 
-            # Check if more pages available
-            if len(results) < self.DEFAULT_PAGE_SIZE:
-                break
+            skip += self.PAGE_SIZE
 
-            skip += self.DEFAULT_PAGE_SIZE
-
-        # Trim to max_results
-        all_documents = all_documents[:max_results]
-
-        # Store search metadata
-        self._last_search = {
-            "query": query,
-            "filters": filters,
-            "any_filters": any_filters,
-            "main_lib": main_lib,
-            "legacy_lib": legacy_lib,
-            "result_count": len(all_documents),
+        docs = docs[:max_results]
+        self.last_search = {
+            "query": query, "filters": filters,
+            "main_lib": main_lib, "legacy_lib": legacy_lib,
+            "result_count": len(docs),
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }
 
-        # Cache results
         if use_cache:
-            self._set_cache(cache_key, all_documents)
+            self._to_cache(cache_key, docs)
 
-        logger.info(f"[search] Returning {len(all_documents)} documents")
-        return all_documents
+        logger.info("[search] %d documents returned", len(docs))
+        return docs
+
+    # ------------------------------------------------------------------
+    # Single document retrieval
+    # ------------------------------------------------------------------
 
     def get_document(self, accession_number: str) -> Optional[AdamsDocument]:
-        """
-        Retrieve a single document by accession number.
-
-        Args:
-            accession_number: NRC accession number (e.g., "ML12345A678")
-
-        Returns:
-            AdamsDocument object or None if not found
-        """
+        """Retrieve a single document by accession number. Returns None if 404."""
         if not accession_number:
-            raise AdamsAPIError("Accession number is required")
-
-        # Normalize accession number
-        accession_number = accession_number.strip().upper()
-
-        headers = self._get_headers()
-        url = f"{self.base_url}/{accession_number}"
-
+            raise AdamsAPIError("accession_number is required")
+        acc = accession_number.strip().upper()
         try:
-            response = self.session.get(url, headers=headers, timeout=self.timeout)
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            if response.status_code == 404:
+            resp = self.session.get(
+                f"{self.base_url}/{acc}", headers=self._headers, timeout=self.timeout)
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError:
+            if resp.status_code == 404:
                 return None
-            raise AdamsAPIError(f"HTTP Error: {e}")
+            raise AdamsAPIError(f"HTTP {resp.status_code}")
         except requests.RequestException as e:
             raise AdamsAPIError(f"Request failed: {e}")
 
-        data = response.json()
-        doc_data = data.get("document", data)
-        return AdamsDocument.from_api_response(doc_data)
+        data = resp.json()
+        return AdamsDocument.from_api_response(data.get("document", data))
 
-    # ─────────────────────────────────────────────
-    # Search Methods
-    # ─────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Convenience search wrappers
+    # ------------------------------------------------------------------
 
-    def search_by_docket(
-        self,
-        docket_number: str,
-        max_results: int = 100,
-        days_back: int = 365,
-        **kwargs,
-    ) -> List[AdamsDocument]:
-        """
-        Search for documents by docket number.
+    def search_by_docket(self, docket_number: str, max_results: int = 100,
+                         days_back: int = 365, **kwargs) -> List[AdamsDocument]:
+        cutoff = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        return self.search(filters=[
+            self.text_filter("DocketNumber", docket_number, "starts"),
+            self.date_filter("DateAddedTimestamp", "ge", cutoff),
+        ], max_results=max_results, **kwargs)
 
-        Args:
-            docket_number: NRC docket number (e.g., "05000373")
-            max_results: Maximum results to return
-            days_back: How many days back to search
-            **kwargs: Additional arguments passed to search()
+    def search_by_document_type(self, document_type: str, query: str = "",
+                                max_results: int = 100, **kwargs) -> List[AdamsDocument]:
+        return self.search(query=query,
+                           filters=[self.text_filter("DocumentType", document_type, "equals")],
+                           max_results=max_results, **kwargs)
 
-        Returns:
-            List of AdamsDocument objects
-        """
-        cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    def search_recent(self, days: int = 30, query: str = "",
+                      max_results: int = 100, **kwargs) -> List[AdamsDocument]:
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        return self.search(query=query,
+                           filters=[self.date_filter("DateAddedTimestamp", "ge", cutoff)],
+                           max_results=max_results, **kwargs)
 
-        filters = [
-            self.build_text_filter("DocketNumber", docket_number, "starts"),
-            self.build_date_filter("DateAddedTimestamp", "ge", cutoff_date),
-        ]
-
-        return self.search(filters=filters, max_results=max_results, **kwargs)
-
-    def search_by_document_type(
-        self,
-        document_type: str,
-        query: str = "",
-        max_results: int = 100,
-        **kwargs,
-    ) -> List[AdamsDocument]:
-        """
-        Search for documents by type.
-
-        Args:
-            document_type: Document type (e.g., "Inspection Report", "LER")
-            query: Optional text query
-            max_results: Maximum results to return
-            **kwargs: Additional arguments passed to search()
-
-        Returns:
-            List of AdamsDocument objects
-        """
-        filters = [
-            self.build_text_filter("DocumentType", document_type, "equals"),
-        ]
-
-        return self.search(query=query, filters=filters, max_results=max_results, **kwargs)
-
-    def search_recent(
-        self,
-        days: int = 30,
-        query: str = "",
-        max_results: int = 100,
-        **kwargs,
-    ) -> List[AdamsDocument]:
-        """
-        Search for recently added documents.
-
-        Args:
-            days: Number of days back to search
-            query: Optional text query
-            max_results: Maximum results to return
-            **kwargs: Additional arguments passed to search()
-
-        Returns:
-            List of AdamsDocument objects
-        """
-        cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-
-        filters = [
-            self.build_date_filter("DateAddedTimestamp", "ge", cutoff_date),
-        ]
-
-        return self.search(query=query, filters=filters, max_results=max_results, **kwargs)
-
-    # ─────────────────────────────────────────────
-    # Google Search Integration
-    # ─────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Google Custom Search
+    # ------------------------------------------------------------------
 
     def google_search(self, query: str, num: int = 10) -> List[Dict[str, Any]]:
         """
-        Perform a Google Custom Search for NRC documents.
-
-        Args:
-            query: Search query
-            num: Number of results (max 10)
-
-        Returns:
-            List of search result dictionaries with title, link, snippet
+        Search Google Custom Search (site:nrc.gov).
+        Requires GOOGLE_API_KEY and GOOGLE_CX.
         """
         if not self.google_api_key or not self.google_cx:
             raise AdamsAPIError(
-                "Google API key and CX must be set to use google_search(). "
-                "Set GOOGLE_API_KEY and GOOGLE_CX environment variables."
-            )
-
-        params = {
-            "key": self.google_api_key,
-            "cx": self.google_cx,
-            "q": query,
-            "num": min(num, 10),
-        }
-
+                "Google search requires GOOGLE_API_KEY and GOOGLE_CX env vars.")
         try:
-            resp = self.session.get(self.google_base_url, params=params, timeout=20)
+            resp = self.session.get(
+                self.GOOGLE_URL,
+                params={"key": self.google_api_key, "cx": self.google_cx,
+                        "q": query, "num": min(num, 10)},
+                timeout=20,
+            )
             resp.raise_for_status()
         except requests.RequestException as e:
-            raise AdamsAPIError(f"Google Search request failed: {e}")
+            raise AdamsAPIError(f"Google search failed: {e}")
 
-        data = resp.json()
-        results = []
+        return [
+            {"title": item.get("title"), "link": item.get("link"),
+             "snippet": item.get("snippet"), "source": "Google"}
+            for item in resp.json().get("items", [])
+            if isinstance(item.get("link"), str)
+            and "@" not in item["link"]
+            and not item["link"].startswith("mailto:")
+        ]
 
-        for item in data.get("items", []):
-            title = item.get("title")
-            link = item.get("link")
-            snippet = item.get("snippet")
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
 
-            if not isinstance(link, str):
-                continue
-            if "@" in link or link.startswith("mailto:"):
-                continue
-
-            results.append({
-                "title": title,
-                "link": link,
-                "snippet": snippet,
-                "source": "Google",
-            })
-
-        return results
-
-    # ─────────────────────────────────────────────
-    # Smart Hybrid Search
-    # ─────────────────────────────────────────────
-
-    def smart_search(
-        self,
-        query: str,
-        top_n: int = 10,
-        use_google: bool = True,
-        include_legacy: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """
-        Hybrid search combining ADAMS API and Google Custom Search.
-
-        Performs relevance scoring and deduplication across both sources.
-
-        Args:
-            query: Search query
-            top_n: Maximum results to return
-            use_google: Whether to include Google search results
-            include_legacy: Whether to include legacy library
-
-        Returns:
-            List of result dictionaries with title, link, accession_number, etc.
-        """
-        logger.info(f"[smart_search] query='{query}'")
-
-        if not query or not query.strip():
-            raise AdamsAPIError("Query cannot be empty.")
-
-        combined = []
-        seen_accessions = set()
-        seen_links = set()
-
-        # 1) ADAMS API search
-        try:
-            adams_docs = self.search(
-                query=query,
-                max_results=top_n * 2,
-                legacy_lib=include_legacy,
-            )
-
-            for doc in adams_docs:
-                acc = doc.accession_number
-                if acc and acc in seen_accessions:
-                    continue
-                if acc:
-                    seen_accessions.add(acc)
-
-                link = doc.get_download_url()
-                if link:
-                    seen_links.add(link)
-
-                combined.append({
-                    "title": doc.title,
-                    "link": link,
-                    "accession_number": acc,
-                    "document_date": doc.document_date,
-                    "added_date": doc.added_date,
-                    "document_type": doc.document_type,
-                    "docket_number": doc.docket_number,
-                    "source": "ADAMS API",
-                })
-        except Exception as e:
-            logger.warning(f"[smart_search] ADAMS search failed: {e}")
-
-        # 2) Google Custom Search (optional)
-        if use_google and self.google_api_key and self.google_cx:
-            try:
-                google_results = self.google_search(
-                    f"site:nrc.gov {query}",
-                    num=top_n,
-                )
-
-                for g in google_results:
-                    link = g.get("link")
-                    if not link or link in seen_links:
-                        continue
-                    seen_links.add(link)
-
-                    # Try to extract accession number from link
-                    acc = None
-                    if "/ML" in link:
-                        try:
-                            acc_start = link.index("/ML") + 1
-                            acc = link[acc_start:acc_start + 12]
-                        except Exception:
-                            pass
-
-                    combined.append({
-                        "title": g.get("title"),
-                        "link": link,
-                        "accession_number": acc,
-                        "snippet": g.get("snippet"),
-                        "source": "Google",
-                    })
-            except Exception as e:
-                logger.warning(f"[smart_search] Google search failed: {e}")
-
-        # 3) Score and sort results
-        query_words = [w.lower() for w in query.split() if len(w) > 2]
-
-        def score(result):
-            text = (
-                (result.get("title") or "") + " " +
-                (result.get("snippet") or "") + " " +
-                (result.get("document_type") or "")
-            ).lower()
-
-            base_score = 0
-            for word in query_words:
-                if word in (result.get("title") or "").lower():
-                    base_score += 3
-                elif word in text:
-                    base_score += 1
-
-            # Boost ADAMS results (more authoritative)
-            if result.get("source") == "ADAMS API":
-                base_score += 2
-
-            return base_score
-
-        for result in combined:
-            result["score"] = score(result)
-
-        combined.sort(key=lambda x: x.get("score", 0), reverse=True)
-
-        logger.info(f"[smart_search] Returning {min(top_n, len(combined))} results")
-        return combined[:top_n]
-
-    # ─────────────────────────────────────────────
-    # Utility Methods
-    # ─────────────────────────────────────────────
-
-    def save_results_to_json(
-        self,
-        documents: List[AdamsDocument],
-        filepath: str,
-        include_metadata: bool = True,
-    ) -> str:
-        """
-        Save search results to a JSON file.
-
-        Args:
-            documents: List of AdamsDocument objects
-            filepath: Output file path
-            include_metadata: Whether to include search metadata
-
-        Returns:
-            The filepath
-        """
-        output = {
-            "documents": [doc.to_dict() for doc in documents],
+    def save_results_to_json(self, documents: List[AdamsDocument],
+                             filepath: str, include_metadata: bool = True) -> str:
+        output: Dict[str, Any] = {
+            "documents": [d.to_dict() for d in documents],
             "count": len(documents),
         }
-
-        if include_metadata and self._last_search:
-            output["search_metadata"] = self._last_search
-
+        if include_metadata and self.last_search:
+            output["search_metadata"] = self.last_search
         with open(filepath, "w") as f:
             json.dump(output, f, indent=2)
-
         return filepath
 
-    def download_documents(
-        self,
-        documents: List[AdamsDocument],
-        directory: str = ".",
-        skip_existing: bool = True,
-        max_concurrent: int = 4,
-    ) -> List[Dict[str, Any]]:
-        """
-        Download multiple documents.
-
-        Args:
-            documents: List of AdamsDocument objects
-            directory: Download directory
-            skip_existing: Skip files that already exist
-            max_concurrent: Maximum concurrent downloads
-
-        Returns:
-            List of result dictionaries with status for each document
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
+    def download_documents(self, documents: List[AdamsDocument], directory: str = ".",
+                           skip_existing: bool = True,
+                           max_concurrent: int = 4) -> List[Dict[str, Any]]:
+        """Download multiple documents concurrently."""
         os.makedirs(directory, exist_ok=True)
-        results = []
 
-        def download_one(doc):
+        def _one(doc):
             try:
-                path = doc.download(directory=directory, skip_existing=skip_existing)
-                return {
-                    "accession_number": doc.accession_number,
-                    "status": "success",
-                    "path": path,
-                }
+                return {"accession_number": doc.accession_number, "status": "success",
+                        "path": doc.download(directory=directory, skip_existing=skip_existing)}
             except Exception as e:
-                return {
-                    "accession_number": doc.accession_number,
-                    "status": "error",
-                    "error": str(e),
-                }
+                return {"accession_number": doc.accession_number, "status": "error", "error": str(e)}
 
-        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-            futures = {executor.submit(download_one, doc): doc for doc in documents}
-            for future in as_completed(futures):
-                results.append(future.result())
+        with ThreadPoolExecutor(max_workers=max_concurrent) as ex:
+            futures = {ex.submit(_one, doc): doc for doc in documents}
+            return [f.result() for f in as_completed(futures)]
 
-        return results
-
-
-# ─────────────────────────────────────────────
-# Module-level convenience function
-# ─────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Module-level factory
+# ---------------------------------------------------------------------------
 
 def create_client(
     api_key: str = None,
@@ -964,14 +552,7 @@ def create_client(
     google_cx: str = None,
     debug: bool = False,
 ) -> AdamsClient:
-    """
-    Create an ADAMS client with configuration from environment variables.
-
-    Environment variables:
-    - ADAMS_API_KEY: ADAMS API subscription key
-    - GOOGLE_API_KEY: Google Custom Search API key
-    - GOOGLE_CX: Google Custom Search Engine ID
-    """
+    """Create an AdamsClient from parameters or environment variables."""
     return AdamsClient(
         api_key=api_key,
         google_api_key=google_api_key,
