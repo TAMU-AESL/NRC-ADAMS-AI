@@ -1,94 +1,72 @@
 """
-ADAMS MCP Server - NRC Document Search and Retrieval (APS / v5)
-
-Uses adams_client_v5 (APS REST API) and auto-enables legacy library only
-when the query implies pre-1999 (e.g., 1990-1995).
+ADAMS MCP Server - NRC Document Search and Retrieval (APS / v5.1)
 
 Tools:
-- search_adams
-- get_document
-- download_adams
-- download_adams_batch
-- summarize_pdf
+  search_adams        – full-text + filter search with auto legacy detection
+  get_document        – metadata by accession number
+  download_adams      – download a single PDF
+  download_adams_batch – batch download (≤50)
+  summarize_pdf       – extract text from a downloaded PDF
+
+Environment:
+  ADAMS_API_KEY   – required
+  GOOGLE_API_KEY  – optional (enables Google search)
+  GOOGLE_CX       – optional (Google Custom Search Engine ID)
 """
 
-import os
 import logging
+import os
 import re
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import Optional, Dict, List, Any, Tuple
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from PyPDF2 import PdfReader
-import requests
-from mcp.server.fastmcp import FastMCP
-from adams_client_v5 import AdamsClient, AdamsDocument, AdamsAPIError
+from typing import Any, Dict, List, Optional, Tuple
 
-# ------------------------------------------------------------
-# Environment
-# ------------------------------------------------------------
+import requests
+from dotenv import load_dotenv
+from mcp.server.fastmcp import FastMCP
+from PyPDF2 import PdfReader
+
+from adams_client_v5 import AdamsAPIError, AdamsClient, AdamsDocument
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
 load_dotenv()
 
 ADAMS_API_KEY = os.getenv("ADAMS_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GOOGLE_CX = os.getenv("GOOGLE_CX")
 
-MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
-MCP_PORT = int(os.getenv("MCP_PORT", "3101"))
-MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http")  # stdio, sse, streamable-http
-
-# ------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------
 logging.basicConfig(
     filename="mcp_server.log",
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
-
 logger = logging.getLogger("ADAMS_MCP")
-search_logger = logging.getLogger("ADAMS_MCP.search")
-download_logger = logging.getLogger("ADAMS_MCP.download")
-pdf_logger = logging.getLogger("ADAMS_MCP.pdf")
+logger.info("Starting ADAMS MCP Server")
+logger.info("ADAMS_API_KEY present: %s", bool(ADAMS_API_KEY))
+logger.info("GOOGLE_API_KEY present: %s", bool(GOOGLE_API_KEY))
+logger.info("GOOGLE_CX present: %s", bool(GOOGLE_CX))
 
-logger.info("Starting ADAMS MCP Server (APS / adams_client_v5)")
-logger.info("ADAMS_API_KEY present? %s", bool(os.getenv("ADAMS_API_KEY")))
-
-# ------------------------------------------------------------
-# Rate Limiter
-# ------------------------------------------------------------
-class SimpleRateLimiter:
-    def __init__(self, calls_per_minute=20):
-        self.interval = 60.0 / calls_per_minute
-        self.lock = Lock()
-        self.last_call = 0.0
-
-    def wait(self):
-        with self.lock:
-            now = time.time()
-            elapsed = now - self.last_call
-            if elapsed < self.interval:
-                time.sleep(self.interval - elapsed)
-            self.last_call = time.time()
-
-rate_limiter = SimpleRateLimiter()
-
-# ------------------------------------------------------------
-# AdamsClient + MCP_Tool
-# ------------------------------------------------------------
 client = AdamsClient(
     api_key=ADAMS_API_KEY,
     google_api_key=GOOGLE_API_KEY,
     google_cx=GOOGLE_CX,
 )
+logger.info("client.google_api_key: %s", bool(client.google_api_key))
+logger.info("client.google_cx: %s", bool(client.google_cx))
 
 mcp = FastMCP(
     "ADAMS_MCP",
-    host=MCP_HOST,
-    port=MCP_PORT,
+    host=os.getenv("MCP_HOST", "0.0.0.0"),
+    port=int(os.getenv("MCP_PORT", "3101")),
 )
+
+DOWNLOADS_DIR = Path.home() / "Downloads" / "ADAMS"
+DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 if not ADAMS_API_KEY:
     logger.warning(
@@ -96,736 +74,601 @@ if not ADAMS_API_KEY:
         "Get a key from https://adams-api-developer.nrc.gov/"
     )
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    def __init__(self, calls_per_minute: int = 20):
+        self._interval = 60.0 / calls_per_minute
+        self._lock = Lock()
+        self._last = 0.0
+
+    def wait(self):
+        with self._lock:
+            gap = time.time() - self._last
+            if gap < self._interval:
+                time.sleep(self._interval - gap)
+            self._last = time.time()
+
+
+_rate = RateLimiter()
+
+# ---------------------------------------------------------------------------
 # Validation
-# ------------------------------------------------------------
-def validate_accession_number(accession: str) -> Tuple[bool, Optional[str]]:
-    if not accession:
-        return False, "Accession number cannot be empty"
-    if not isinstance(accession, str):
-        return False, "Accession number must be a string"
-    accession = accession.strip().upper()
-    if len(accession) < 6:
-        return False, "Accession number is too short"
-    # Modern accession numbers start with ML; legacy pre-1999 docs use other formats
-    # (e.g. 7500001, 8012345, 9200001) — allow both.
-    if not re.match(r"^[A-Z0-9]+$", accession):
-        return False, "Accession number contains invalid characters"
-    return True, None
+# ---------------------------------------------------------------------------
 
-def validate_query(query: str) -> Tuple[bool, Optional[str]]:
-    if not query or not query.strip():
-        return False, "Query cannot be empty"
-    if len(query.strip()) < 2:
-        return False, "Query must be at least 2 characters"
-    if len(query) > 500:
-        return False, "Query is too long (max 500 characters)"
-    return True, None
+def _validate_query(query: str) -> Optional[str]:
+    """Return an error string, or None if valid."""
+    q = (query or "").strip()
+    if not q:
+        return "Query cannot be empty"
+    if len(q) < 2:
+        return "Query must be at least 2 characters"
+    if len(q) > 500:
+        return "Query too long (max 500 characters)"
+    return None
 
-# ------------------------------------------------------------
-# Utils: Year Detection
-# ------------------------------------------------------------
-def extract_year_range(query: str) -> Optional[Tuple[int, int]]:
+
+def _validate_accession(acc: str) -> Optional[str]:
+    acc = (acc or "").strip().upper()
+    if not acc:
+        return "Accession number cannot be empty"
+    if len(acc) < 6:
+        return "Accession number too short"
+    if not re.match(r"^[A-Z0-9]+$", acc):
+        return "Accession number contains invalid characters"
+    return None
+
+# ---------------------------------------------------------------------------
+# Year & legacy detection
+# ---------------------------------------------------------------------------
+
+def _extract_year_range(query: str) -> Optional[Tuple[int, int]]:
     """
-    Recognizes:
-      - "1975-1979", "1975–1979"
-      - "from 1975 to 1979"
-      - single year "1962"
-      - "1950s" (treated as 1950-1959)
+    Detect year or year-range in a query string.
+    Recognises:  2010-2015 | 2010–2015 | from 2010 to 2015 | 1990s | 1990
+    Returns (start_year, end_year) or None.
     """
     q = query or ""
-
-    m = re.search(r"\b(18\d{2}|19\d{2}|20\d{2})\s*(?:[-–]|to)\s*(18\d{2}|19\d{2}|20\d{2})\b", q, flags=re.IGNORECASE)
+    # Explicit range  e.g. 1985-1990 or 1985 to 1990
+    m = re.search(
+        r"\b(1[89]\d{2}|20\d{2})\s*(?:[-–]|to)\s*(1[89]\d{2}|20\d{2})\b",
+        q, re.IGNORECASE)
     if m:
-        y1, y2 = int(m.group(1)), int(m.group(2))
-        return (min(y1, y2), max(y1, y2))
-
-    m = re.search(r"\b(18\d{2}|19\d{2}|20\d{2})s\b", q, flags=re.IGNORECASE)
+        return min(int(m[1]), int(m[2])), max(int(m[1]), int(m[2]))
+    # Decade  e.g. 1990s
+    m = re.search(r"\b(1[89]\d{2}|20\d{2})s\b", q, re.IGNORECASE)
     if m:
-        decade = int(m.group(1))
-        return (decade, decade + 9)
-
-    m = re.search(r"\b(18\d{2}|19\d{2}|20\d{2})\b", q)
+        d = int(m[1])
+        return d, d + 9
+    # Single year
+    m = re.search(r"\b(1[89]\d{2}|20\d{2})\b", q)
     if m:
-        y = int(m.group(1))
-        return (y, y)
-
+        y = int(m[1])
+        return y, y
     return None
 
-def query_implies_pre_1999(query: str) -> bool:
-    yr = extract_year_range(query)
-    if yr:
-        # Any query touching a year before 2000 needs legacy lib
-        return yr[0] < 2000
 
-    q = (query or "").lower()
-    # Natural-language era triggers including decade shorthand (seventies, eighties, etc.)
+def _needs_legacy(query: str, year_range: Optional[Tuple[int, int]],
+                  date_from: Optional[str] = None) -> bool:
+    """
+    Return True if the legacy library should be searched.
+    Triggers: year range touching pre-2000, explicit date_from before 2000,
+    or natural-language era keywords.
+    """
+    if year_range and year_range[0] < 2000:
+        return True
+    # Explicit date_from touching pre-2000 also implies legacy content
+    if date_from:
+        try:
+            if int(date_from[:4]) < 2000:
+                return True
+        except (ValueError, IndexError):
+            pass
     return bool(re.search(
-        r"\b(pre|before)\s*[- ]?(?:19)?99\b"
-        r"|\blegacy\b|\bpre-?adams\b"
-        r"|\b(?:seventies|eighties|nineties)\b"
-        r"|\b(?:19[6-9]\d)s?\b",
-        q,
+        r"\b(legacy|pre-?adams|before\s*(?:19)?99|seventies|eighties|nineties)\b"
+        r"|\b19[6-9]\d\b",
+        (query or "").lower(),
     ))
 
-def year_range_to_dates(year_range: Tuple[int, int]) -> Tuple[str, str]:
-    start_y, end_y = year_range
-    return f"{start_y:04d}-01-01", f"{end_y:04d}-12-31"
 
-def strip_year_tokens(q: str) -> str:
-    """
-    Remove year references from the query so date filters
-    control the time constraint instead of full-text search.
-    """
-    q = re.sub(
-        r"\b(18\d{2}|19\d{2}|20\d{2})\s*(?:[-–]|to)\s*(18\d{2}|19\d{2}|20\d{2})\b",
-        " ",
-        q,
-        flags=re.IGNORECASE,
-    )
-    q = re.sub(r"\b(18\d{2}|19\d{2}|20\d{2})s\b", " ", q, flags=re.IGNORECASE)
-    q = re.sub(r"\b(18\d{2}|19\d{2}|20\d{2})\b", " ", q)
+def _strip_years(query: str) -> str:
+    """Remove year tokens so date filters handle the constraint."""
+    q = re.sub(r"\b(1[89]\d{2}|20\d{2})\s*(?:[-–]|to)\s*(1[89]\d{2}|20\d{2})\b",
+               " ", query, flags=re.IGNORECASE)
+    q = re.sub(r"\b(1[89]\d{2}|20\d{2})s\b", " ", q, flags=re.IGNORECASE)
+    q = re.sub(r"\b(1[89]\d{2}|20\d{2})\b", " ", q)
     return re.sub(r"\s+", " ", q).strip()
 
-def _drop_documentdate_filters(filters: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
-    """
-    Legacy results often can't satisfy DocumentDate range filters because DocumentDate is unknown.
-    Removing those filters prevents legacy starvation.
-    """
-    if not filters:
-        return filters
-    kept = []
-    for f in filters:
-        field = str(f.get("field", "")).lower()
-        if field == "documentdate":
-            continue
-        kept.append(f)
-    return kept
+# ---------------------------------------------------------------------------
+# Scoring & dedup 
+# ---------------------------------------------------------------------------
 
-def build_api_filters_from_inputs(
-    *,
-    query: str,
-    docket_number: Optional[str],
-    document_type: Optional[str],
-    days_back: Optional[int],
-    user_filters: Optional[Dict[str, Any]],
-) -> List[Dict[str, str]]:
-    """
-    Build APS filters using adams_client_v5 helpers where possible.
-    Also injects query-implied year range into DocumentDate filters.
-    """
-    api_filters: List[Dict[str, str]] = []
-
-    # 1) docket/document_type
-    if docket_number:
-        api_filters.append(client.build_text_filter("DocketNumber", docket_number, "starts"))
-
-    if document_type:
-        api_filters.append(client.build_text_filter("DocumentType", document_type, "equals"))
-
-    # 2) days_back => DateAddedTimestamp >= cutoff
-    if days_back:
-        cutoff_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        api_filters.append(client.build_date_filter("DateAddedTimestamp", "ge", cutoff_date))
-
-    # 3) user-provided date_from/date_to => DocumentDate range
-    #    (push into API, not post-filter only)
-    if user_filters:
-        if "date_from" in user_filters:
-            api_filters.append(client.build_date_filter("DocumentDate", "ge", str(user_filters["date_from"])))
-        if "date_to" in user_filters:
-            api_filters.append(client.build_date_filter("DocumentDate", "le", str(user_filters["date_to"])))
-
-        # document_type can also be provided via user_filters
-        if "document_type" in user_filters and not document_type:
-            dt = user_filters["document_type"]
-            if isinstance(dt, str):
-                api_filters.append(client.build_text_filter("DocumentType", dt, "equals"))
-            elif isinstance(dt, list):
-                # AND semantics: multiple equals will be too strict.
-                # Use only the first here; users can call multiple searches if needed.
-                if dt:
-                    api_filters.append(client.build_text_filter("DocumentType", str(dt[0]), "equals"))
-
-    # 4) query-implied year range (only if user didn't already set date_from/date_to)
-    yr = extract_year_range(query)
-    user_set_dates = bool(user_filters and ("date_from" in user_filters or "date_to" in user_filters))
-    if yr and not user_set_dates:
-        d_from, d_to = year_range_to_dates(yr)
-        api_filters.append(client.build_date_filter("DocumentDate", "ge", d_from))
-        api_filters.append(client.build_date_filter("DocumentDate", "le", d_to))
-
-    return api_filters
-
-# ------------------------------------------------------------
-# Relevance / dedupe / post-filters
-# ------------------------------------------------------------
-def tokenize(text: str) -> set[str]:
-    return set(re.findall(r"[a-zA-Z0-9]+", (text or "").lower()))
-
-
-def score_relevance(query: str, title: Optional[str], doc_type: Optional[str]) -> float:
+def _score(query: str, title: Optional[str], doc_type: Optional[str]) -> float:
     if not title:
         return 0.0
-
-    q_tokens = tokenize(query)
-    t_tokens = tokenize(title)
-
-    overlap = q_tokens & t_tokens
-    score = (len(overlap) / max(len(q_tokens), 1)) * 10.0
-
+    q_tok = set(re.findall(r"[a-zA-Z0-9]+", query.lower()))
+    t_tok = set(re.findall(r"[a-zA-Z0-9]+", title.lower()))
+    overlap_ratio = len(q_tok & t_tok) / max(len(q_tok), 1)
+    score = overlap_ratio * 10.0
     if query.lower() in title.lower():
         score += 8.0
-
-    if doc_type:
-        dt = doc_type.lower()
-        if "inspection" in dt:
-            score += 2.0
-        if "reactor" in dt:
-            score += 1.5
-        if "safety" in dt:
-            score += 1.0
-
+    dt = (doc_type or "").lower()
+    for kw, pts in [("inspection", 2.0), ("reactor", 1.5), ("safety", 1.0)]:
+        if kw in dt:
+            score += pts
     return round(score, 2)
 
-def fingerprint_result(item: dict) -> str:
-    if item.get("accession_number"):
-        return item["accession_number"]
-    if item.get("link"):
-        return item["link"].lower().strip()
-    return (item.get("title") or "").lower().strip()
+
+def _fingerprint(result: Dict) -> str:
+    return (result.get("accession_number")
+            or (result.get("url") or result.get("link") or "").lower().strip()
+            or (result.get("title") or "").lower().strip())
 
 
-def apply_post_filters(results: List[Dict[str, Any]], filters: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not filters:
-        return results
+def _dedup(results: List[Dict]) -> List[Dict]:
+    seen, out = set(), []
+    for r in results:
+        fp = _fingerprint(r)
+        if fp not in seen:
+            seen.add(fp)
+            out.append(r)
+    return out
 
-    filtered = results
+# ---------------------------------------------------------------------------
+# PDF fetch with fallbacks
+# ---------------------------------------------------------------------------
 
-    # min_score (local)
-    if "min_score" in filters:
-        try:
-            min_score = float(filters["min_score"])
-            filtered = [r for r in filtered if r.get("score", 0) >= min_score]
-        except Exception:
-            pass
-
-    # source (back-compat only)
-    if "source" in filters:
-        src = filters["source"]
-        filtered = [r for r in filtered if r.get("source") == src]
-
-    return filtered
-
-# ------------------------------------------------------------
-# Downloads Folder
-# ------------------------------------------------------------
-def get_downloads_folder() -> Path:
-    path = Path.home() / "Downloads" / "ADAMS"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-# ------------------------------------------------------------
-# Robust PDF Fetch
-# ------------------------------------------------------------
-def fetch_pdf(url: str, retries: int = 3, timeout: int = 20) -> Optional[bytes]:
+def _fetch_pdf(url: str, retries: int = 3, timeout: int = 20) -> Optional[bytes]:
     for attempt in range(1, retries + 1):
         try:
-            download_logger.info(f"Fetching PDF (attempt {attempt}/{retries}): {url}")
-            response = requests.get(url, timeout=timeout, stream=True)
-            response.raise_for_status()
-
-            content_type = response.headers.get("Content-Type", "").lower()
-            if "pdf" not in content_type:
-                download_logger.warning(f"Non-PDF content type: {content_type}")
+            resp = requests.get(url, timeout=timeout, stream=True)
+            resp.raise_for_status()
+            if "pdf" not in resp.headers.get("Content-Type", "").lower():
                 return None
-
-            content_length = response.headers.get("Content-Length")
-            if content_length:
-                if int(content_length) > 50_000_000:
-                    return None
-
-            return response.content
-
-        except requests.exceptions.HTTPError:
-            status = getattr(response, "status_code", None)
-            if status in (401, 403, 404):
+            size = resp.headers.get("Content-Length")
+            if size and int(size) > 50_000_000:
+                return None
+            return resp.content
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code in (401, 403, 404):
                 return None
         except Exception:
             pass
-
         if attempt < retries:
             time.sleep(2 ** attempt)
-
     return None
 
-# ------------------------------------------------------------
-# TOOL: SEARCH
-# ------------------------------------------------------------
+
+def _pdf_urls(accession: str, api_url: Optional[str]) -> List[str]:
+    """Build ordered list of URLs to try when downloading a PDF."""
+    acc = accession.strip().upper()
+    folder6 = acc[:6]
+    urls = []
+    if api_url:
+        urls.append(api_url)
+    urls.append(f"https://www.nrc.gov/docs/{folder6}/{acc}.pdf")
+    urls.append(f"https://pbadupws.nrc.gov/docs/{folder6}/{acc}.pdf")
+    if not acc.startswith("ML"):
+        urls.append(f"https://www.nrc.gov/reading-rm/doc-collections/ACRS/old-reports/{acc}.pdf")
+        urls.append(f"https://www.nrc.gov/docs/{acc[:4]}/{acc}.pdf")
+    return urls
+
+# ---------------------------------------------------------------------------
+# TOOL: ADAMS Search
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 async def search_adams(
     query: str,
     top_n: int = 5,
-    max_results: Optional[int] = None,
-    max_pages: int = 1,
-    use_google: bool = False,
-    filters: Optional[Dict[str, Any]] = None,
-    sort_by: str = "score",
-    sort_desc: bool = True,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    date_field: str = "DocumentDate",
     docket_number: Optional[str] = None,
     document_type: Optional[str] = None,
     days_back: Optional[int] = None,
+    use_google: bool = True,
+    sort_by: str = "score",
+    sort_desc: bool = True,
 ) -> Dict[str, Any]:
     """
-    Search NRC ADAMS via adams_client_v5 (APS REST API).
+    Search NRC ADAMS via the APS REST API.
 
-    Legacy behavior:
-      - legacy_lib is auto-enabled ONLY if query implies a year < 1999
-        (e.g., "1990-1995" or "1992").
+    Args:
+        query:         Full-text search string.
+        top_n:         Maximum results to return (default 5).
+        date_from:     Start date filter, YYYY-MM-DD.
+        date_to:       End date filter, YYYY-MM-DD.
+        date_field:    Field to apply date_from/date_to against:
+                       "DocumentDate" (default) or "DateAddedTimestamp".
+        docket_number: Filter by NRC docket number prefix.
+        document_type: Filter by exact document type (e.g. "Inspection Report").
+        days_back:     Shorthand: docs added within the last N days
+                       (applies to DateAddedTimestamp, independent of date_from/date_to).
+        use_google:    Also search Google (site:nrc.gov) and merge results.
+                       Silently skipped if GOOGLE_API_KEY/CX are not set.
+        sort_by:       "score" | "document_date" | "added_date" | "title".
+        sort_desc:     Sort descending (default True).
+
+    Notes:
+        - Year references in *query* (e.g. "1992", "1985-1990") automatically
+          set DocumentDate filters and enable the legacy library.
+        - Explicit date_from / date_to always override query-implied years.
+        - Legacy library is also auto-enabled when date_from references a pre-2000 year.
     """
-    search_logger.info(f"Search request: query='{query}', top_n={top_n}, filters={filters}")
+    err = _validate_query(query)
+    if err:
+        return {"error": err, "query": query}
 
-    is_valid, error_msg = validate_query(query)
-    if not is_valid:
-        return {"error": error_msg, "query": query}
-
-    if max_results is not None:
-        top_n = max_results
-
- # ------------------------------------------------------------
-    # Detect year range and control library selection
-    # ------------------------------------------------------------
-    yr: Optional[Tuple[int, int]] = extract_year_range(query)
-
-    # Default behavior
-    legacy_lib = query_implies_pre_1999(query)
-    main_lib = True
-
-    # If year range explicitly detected, allow both (website-like behavior)
-    if yr:
-        start_y, end_y = yr
-        if end_y < 1999:
-            main_lib = True
-            legacy_lib = True
-        elif start_y < 1999 <= end_y:
-            main_lib = True
-            legacy_lib = True
-        else:
-            # fully post-1999: main only
-            main_lib = True
-            legacy_lib = False
-
-    # ------------------------------------------------------------
-    # Strip year tokens from the full-text portion of the query
-    # ------------------------------------------------------------
-    clean_query = strip_year_tokens(query) if yr else query
-    has_terms = bool(clean_query.strip())
-
-    # If stripping leaves nothing (e.g., "1990-1998"), don't send empty query to API.
-    # Use a broad token that tends to match widely.
-    q_api = clean_query if has_terms else "a"
-
-    # ------------------------------------------------------------
-    # Build API filters (push date constraints into API)
-    # ------------------------------------------------------------
-    api_filters = build_api_filters_from_inputs(
-        query=clean_query if has_terms else "",  # many implementations ignore query here anyway
-        docket_number=docket_number,
-        document_type=document_type,
-        days_back=days_back,
-        user_filters=filters,
+    logger.info(
+        "Search: query='%s' top_n=%d date_from=%s date_to=%s date_field=%s",
+        query, top_n, date_from, date_to, date_field,
     )
 
-    # Sort choice: if the user gave a year, sorting by DocumentDate makes sense.
-    api_sort = "DocumentDate" if (yr or sort_by == "document_date") else "DateAddedTimestamp"
-    api_sort_dir = 1 if sort_desc else 0  # your client uses 1=desc, 0=asc
+    # -- Year / legacy detection ------------------------------------------
+    yr = _extract_year_range(query)
+    use_legacy = _needs_legacy(query, yr, date_from=date_from)
+    clean_query = _strip_years(query) if yr else query
+    q_api = clean_query.strip() or "a"   # API rejects empty string
 
+    # -- Build API filters -------------------------------------------------
+    api_filters = []
+
+    if docket_number:
+        api_filters.append(client.text_filter("DocketNumber", docket_number, "starts"))
+    if document_type:
+        api_filters.append(client.text_filter("DocumentType", document_type, "equals"))
+    if days_back:
+        cutoff = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        api_filters.append(client.date_filter("DateAddedTimestamp", "ge", cutoff))
+
+    # Explicit date_from / date_to win over inferred year range
+    if date_from or date_to:
+        if date_from:
+            api_filters.append(client.date_filter(date_field, "ge", date_from))
+        if date_to:
+            api_filters.append(client.date_filter(date_field, "le", date_to))
+    elif yr:
+        d_from = f"{yr[0]:04d}-01-01"
+        d_to   = f"{yr[1]:04d}-12-31"
+        api_filters.append(client.date_filter("DocumentDate", "ge", d_from))
+        api_filters.append(client.date_filter("DocumentDate", "le", d_to))
+
+    date_range_active = bool(date_from or date_to or yr)
+    api_sort = "DocumentDate" if (date_range_active or sort_by == "document_date") else "DateAddedTimestamp"
+    api_sort_dir = 1 if sort_desc else 0
+    fetch_n = max(top_n * 5, 50)
+
+    # -- Two-pass search (main + legacy) -----------------------------------
+    raw_docs: List[AdamsDocument] = []
     try:
-        rate_limiter.wait()
-
-        # ------------------------------------------------------------
-        # Two-pass search prevents legacy starvation:
-        #   PASS 1 (main): apply filters as-is
-        #   PASS 2 (legacy): if yr, drop DocumentDate filters
-        # ------------------------------------------------------------
-        api_docs: List[AdamsDocument] = []
-
-        # PASS 1: main library
-        if main_lib:
-            docs_main = client.search(
-                query=q_api,
-                filters=api_filters if api_filters else None,
-                max_results=max(top_n * 5, 50),
-                max_pages=max_pages,
-                main_lib=True,
-                legacy_lib=False,
-                sort=api_sort,
-                sort_direction=api_sort_dir,
+        _rate.wait()
+        raw_docs += client.search(
+            query=q_api, filters=api_filters,
+            max_results=fetch_n, main_lib=True, legacy_lib=False,
+            sort=api_sort, sort_direction=api_sort_dir,
+        )
+        if use_legacy:
+            _rate.wait()
+            # Legacy docs rarely have DocumentDate; drop those filters so results aren't starved
+            legacy_filters = [f for f in api_filters
+                              if str(f.get("field", "")).lower() != "documentdate"]
+            raw_docs += client.search(
+                query=q_api, filters=legacy_filters,
+                max_results=fetch_n, main_lib=False, legacy_lib=True,
+                sort=api_sort, sort_direction=api_sort_dir,
             )
-            api_docs.extend(docs_main)
-
-        # PASS 2: legacy library (remove DocumentDate filters when year-range requested)
-        if legacy_lib:
-            legacy_filters = api_filters if api_filters else None
-            if yr and legacy_filters:
-                legacy_filters = _drop_documentdate_filters(legacy_filters)
-
-            docs_legacy = client.search(
-                query=q_api,
-                filters=legacy_filters if legacy_filters else None,
-                max_results=max(top_n * 5, 50),
-                max_pages=max_pages,
-                main_lib=False,
-                legacy_lib=True,
-                sort=api_sort,
-                sort_direction=api_sort_dir,
-            )
-            api_docs.extend(docs_legacy)
-
-        results: List[Dict[str, Any]] = []
-        for doc in api_docs:
-            results.append({
-                "title": doc.title,
-                "accession_number": doc.accession_number,
-                "document_type": doc.document_type,
-                "document_date": doc.document_date,
-                "added_date": doc.added_date,
-                "docket_number": doc.docket_number,
-                "author_name": doc.author_name,
-                "url": doc.get_download_url(),
-                "source": "ADAMS API",
-                "score": score_relevance(query, doc.title, doc.document_type),
-                "rationale": "Matched ADAMS API"
-            })
-
-        # ------------------------------------------------------------
-        # Handle legacy "unknown date" records (stored as 1900-01-01)
-        # For pre-2000 queries the legacy library often has NO DocumentDate,
-        # so we must NOT drop those results — they're the whole point.
-        # ------------------------------------------------------------
-        if yr:
-            before = len(results)
-
-            def _is_unknown_date(r: Dict[str, Any]) -> bool:
-                d = (r.get("document_date") or "").strip()
-                return d == "1900-01-01" or d.startswith("1900-01-01")
-
-            non_unknown = [r for r in results if not _is_unknown_date(r)]
-            unknown_docs = [r for r in results if _is_unknown_date(r)]
-
-            if not legacy_lib:
-                # Post-1999 query: safe to drop sentinel dates
-                results = non_unknown
-            elif non_unknown:
-                # We have real-dated results — prefer those but keep unknowns as supplement
-                results = non_unknown + unknown_docs
-            else:
-                # Only legacy results with unknown dates — keep all of them;
-                # dropping them would leave the user with nothing.
-                results = unknown_docs
-
-            search_logger.info(
-                "Year-range query: %d unknown-date results (1900-01-01); "
-                "non_unknown=%d; final=%d",
-                len(unknown_docs),
-                len(non_unknown),
-                len(results),
-            )
-
-        # Optional Google (kept)
-        if use_google:
-            if not (GOOGLE_API_KEY and GOOGLE_CX):
-                return {"error": "Google search requested but API key/CX not configured"}
-
-            rate_limiter.wait()
-            # Better targeting for ADAMS PDFs
-            search_query = f"site:pbadupws.nrc.gov {query}"
-            google_hits = client.google_search(search_query, num=min(top_n, 10))
-            for g in google_hits:
-                results.append({
-                    "title": g.get("title"),
-                    "link": g.get("link"),
-                    "snippet": g.get("snippet"),
-                    "source": "Google",
-                    "score": score_relevance(query, g.get("title"), None),
-                    "rationale": "Google NRC ADAMS domain result"
-                })
-
-        # Deduplicate
-        seen = set()
-        deduped = []
-        for r in results:
-            fp = fingerprint_result(r)
-            if fp in seen:
-                continue
-            seen.add(fp)
-            deduped.append(r)
-
-        # Post-filters (min_score etc.)
-        deduped = apply_post_filters(deduped, filters)
-
-        # Safe sort
-        sort_field_map = {
-            "score": "score",
-            "title": "title",
-            "document_date": "document_date",
-            "added_date": "added_date",
-        }
-        sort_field = sort_field_map.get(sort_by, "score")
-        deduped.sort(key=lambda r: r.get(sort_field, "") if sort_field != "score" else r.get("score", 0), reverse=sort_desc)
-
-        final_results = deduped[:top_n]
-        return {
-            "results": final_results,
-            "returned": len(final_results),
-            "after_dedup": len(deduped),
-            "api_filters_applied": len(api_filters),
-            "legacy_lib_used": legacy_lib,
-            "main_lib_used": main_lib,
-            "year_range_detected": yr,
-            "query_used": clean_query,
-        }
-
     except AdamsAPIError as e:
-        search_logger.error(f"ADAMS API error: {e}")
-        return {"error": f"ADAMS API error: {str(e)}", "query": query}
+        return {"error": f"ADAMS API error: {e}", "query": query}
     except Exception as e:
-        search_logger.exception("Unexpected search failure")
-        return {"error": f"Search failed: {str(e)}", "query": query}
+        logger.exception("Unexpected search error")
+        return {"error": f"Search failed: {e}", "query": query}
 
-# ------------------------------------------------------------
-# TOOL: GET DOCUMENT
-# ------------------------------------------------------------
+    # -- Convert to result dicts ------------------------------------------
+    results: List[Dict[str, Any]] = [
+        {
+            "title": doc.title,
+            "accession_number": doc.accession_number,
+            "document_type": doc.document_type,
+            "document_date": doc.document_date,
+            "added_date": doc.added_date,
+            "docket_number": doc.docket_number,
+            "author_name": doc.author_name,
+            "url": doc.get_download_url(),
+            "source": "ADAMS API",
+            "score": _score(query, doc.title, doc.document_type),
+        }
+        for doc in raw_docs
+    ]
+
+    # -- Handle legacy sentinel dates (1900-01-01 = "date unknown") -------
+    # For pre-2000 / explicit date-range queries keep them — they may be
+    # the only results available in the legacy library.
+    if date_range_active:
+        def _is_unknown_date(r: Dict[str, Any]) -> bool:
+            return (r.get("document_date") or "").strip().startswith("1900-01-01")
+
+        non_unknown = [r for r in results if not _is_unknown_date(r)]
+        unknown_docs = [r for r in results if _is_unknown_date(r)]
+
+        if not use_legacy:
+            results = non_unknown
+        elif non_unknown:
+            results = non_unknown + unknown_docs
+        else:
+            results = unknown_docs
+
+        logger.info(
+            "Date-range query: unknown_date=%d non_unknown=%d final=%d",
+            len(unknown_docs), len(non_unknown), len(results),
+        )
+
+    # -- Google (graceful skip when keys not set) -------------------------
+    google_warning = None
+    if use_google:
+        if client.google_api_key and client.google_cx:
+            try:
+                _rate.wait()
+                seen_urls = {r["url"] for r in results if r.get("url")}
+                for g in client.google_search(f"site:nrc.gov {query}", num=top_n):
+                    link = g.get("link", "")
+                    if link in seen_urls:
+                        continue
+                    seen_urls.add(link)
+                    # Try to extract accession number from URL path
+                    acc = None
+                    m = re.search(r"/(ML[A-Z0-9]{9,12})\.pdf", link, re.IGNORECASE)
+                    if m:
+                        acc = m.group(1).upper()
+                    results.append({
+                        "title": g.get("title"),
+                        "accession_number": acc,
+                        "url": link,
+                        "snippet": g.get("snippet"),
+                        "source": "Google",
+                        "score": _score(query, g.get("title"), None),
+                    })
+            except Exception as e:
+                google_warning = f"Google search failed: {e}"
+                logger.warning(google_warning)
+        else:
+            google_warning = "Google search skipped: GOOGLE_API_KEY / GOOGLE_CX not configured"
+            logger.warning(google_warning)
+
+    # -- Dedup + sort + trim ----------------------------------------------
+    results = _dedup(results)
+
+    sort_key_map = {
+        "score":         lambda r: r.get("score", 0),
+        "document_date": lambda r: r.get("document_date") or "",
+        "added_date":    lambda r: r.get("added_date") or "",
+        "title":         lambda r: (r.get("title") or "").lower(),
+    }
+    results.sort(key=sort_key_map.get(sort_by, sort_key_map["score"]), reverse=sort_desc)
+
+    final = results[:top_n]
+
+    out: Dict[str, Any] = {
+        "results": final,
+        "returned": len(final),
+        "total_before_trim": len(results),
+        "legacy_lib_used": use_legacy,
+        "year_range_detected": yr,
+        "date_from_used": date_from,
+        "date_to_used": date_to,
+        "date_field_used": date_field,
+        "date_filters_applied": bool(date_from or date_to or days_back or yr),
+        "query_used": clean_query,
+    }
+    if google_warning:
+        out["google_warning"] = google_warning
+    return out
+
+# ---------------------------------------------------------------------------
+# TOOL: Document Retreival 
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 async def get_document(accession_number: str) -> Dict[str, Any]:
     """
-    Retrieve document metadata from ADAMS by accession number.
-    """
-    download_logger.info(f"Get document request: {accession_number}")
+    Retrieve full metadata for a single ADAMS document by accession number.
 
-    is_valid, error_msg = validate_accession_number(accession_number)
-    if not is_valid:
-        return {"error": error_msg, "accession_number": accession_number}
+    Args:
+        accession_number: NRC accession number (e.g. "ML12345A678").
+    """
+    err = _validate_accession(accession_number)
+    if err:
+        return {"error": err, "accession_number": accession_number}
 
     try:
-        rate_limiter.wait()
+        _rate.wait()
         doc = client.get_document(accession_number)
-
-        if not doc:
-            return {"error": "Document not found", "accession_number": accession_number}
-
-        return {
-            "status": "success",
-            "accession_number": doc.accession_number,
-            "title": doc.title,
-            "document_date": doc.document_date,
-            "added_date": doc.added_date,
-            "document_type": doc.document_type,
-            "author_name": doc.author_name,
-            "author_affiliation": doc.author_affiliation,
-            "docket_number": doc.docket_number,
-            "license_number": doc.license_number,
-            "page_count": doc.page_count,
-            "url": doc.get_download_url(),
-            "keywords": doc.keywords,
-            "is_legacy": doc.is_legacy,
-            "is_package": doc.is_package,
-        }
-
     except AdamsAPIError as e:
-        download_logger.error(f"ADAMS API error: {e}")
-        return {"error": f"ADAMS API error: {str(e)}", "accession_number": accession_number}
+        return {"error": str(e), "accession_number": accession_number}
     except Exception as e:
-        download_logger.exception("Unexpected get_document failure")
-        return {"error": f"Failed: {str(e)}", "accession_number": accession_number}
+        logger.exception("get_document failed")
+        return {"error": str(e), "accession_number": accession_number}
 
-# ------------------------------------------------------------
-# TOOL: DOWNLOAD SINGLE (API URL first)
-# ------------------------------------------------------------
+    if not doc:
+        return {"error": "Document not found", "accession_number": accession_number}
+
+    return {
+        "status": "success",
+        "accession_number": doc.accession_number,
+        "title": doc.title,
+        "document_date": doc.document_date,
+        "added_date": doc.added_date,
+        "document_type": doc.document_type,
+        "author_name": doc.author_name,
+        "author_affiliation": doc.author_affiliation,
+        "docket_number": doc.docket_number,
+        "license_number": doc.license_number,
+        "page_count": doc.page_count,
+        "url": doc.get_download_url(),
+        "keywords": doc.keywords,
+        "is_legacy": doc.is_legacy,
+        "is_package": doc.is_package,
+    }
+
+# ---------------------------------------------------------------------------
+# TOOL: ADAMS Download
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 async def download_adams(accession_number: str) -> Dict[str, Any]:
-    download_logger.info(f"Download request: {accession_number}")
+    """
+    Download a single ADAMS document PDF.
 
-    is_valid, error_msg = validate_accession_number(accession_number)
-    if not is_valid:
-        return {"error": error_msg, "accession_number": accession_number}
+    The file is saved to ~/Downloads/ADAMS/<accession_number>.pdf.
 
-    accession_number = accession_number.strip().upper()
-    dest = get_downloads_folder() / f"{accession_number}.pdf"
+    Args:
+        accession_number: NRC accession number (e.g. "ML12345A678").
+    """
+    err = _validate_accession(accession_number)
+    if err:
+        return {"error": err, "accession_number": accession_number}
+
+    acc = accession_number.strip().upper()
+    dest = DOWNLOADS_DIR / f"{acc}.pdf"
 
     try:
-        # 1) Use API to get canonical URL
-        rate_limiter.wait()
-        doc = client.get_document(accession_number)
-        url = doc.get_download_url() if doc else None
+        _rate.wait()
+        doc = client.get_document(acc)
+        api_url = doc.get_download_url() if doc else None
+    except Exception:
+        api_url = None
 
-        # 2) Fallback patterns (only if needed)
-        folder = accession_number[:6]
-        legacy_folder = accession_number[:4] if not accession_number.startswith("ML") else None
-        urls_to_try = [u for u in [
-            url,
-            f"https://www.nrc.gov/docs/{folder}/{accession_number}.pdf",
-            f"https://pbadupws.nrc.gov/docs/{folder}/{accession_number}.pdf",
-            # Legacy pre-1999 public document server
-            f"https://www.nrc.gov/reading-rm/doc-collections/ACRS/old-reports/{accession_number}.pdf" if not accession_number.startswith("ML") else None,
-            f"https://www.nrc.gov/docs/{legacy_folder}/{accession_number}.pdf" if legacy_folder else None,
-        ] if u]
+    pdf = None
+    used_url = None
+    for url in _pdf_urls(acc, api_url):
+        pdf = _fetch_pdf(url)
+        if pdf:
+            used_url = url
+            break
 
-        pdf = None
-        used_url = None
-        for u in urls_to_try:
-            pdf = fetch_pdf(u)
-            if pdf:
-                used_url = u
-                break
+    if not pdf:
+        return {"error": "Could not fetch a valid PDF",
+                "accession_number": acc,
+                "urls_tried": _pdf_urls(acc, api_url)}
 
-        if not pdf:
-            return {"error": "Failed to fetch valid PDF", "urls_tried": urls_to_try, "accession_number": accession_number}
+    dest.write_bytes(pdf)
+    return {"status": "success", "path": str(dest),
+            "url": used_url, "size_bytes": len(pdf),
+            "accession_number": acc}
 
-        dest.write_bytes(pdf)
-        return {"status": "success", "path": str(dest), "url": used_url, "size_bytes": len(pdf), "accession_number": accession_number}
+# ---------------------------------------------------------------------------
+# TOOL: Download Batch
+# ---------------------------------------------------------------------------
 
-    except AdamsAPIError as e:
-        return {"error": f"ADAMS API error: {str(e)}", "accession_number": accession_number}
-    except Exception as e:
-        download_logger.exception("Unexpected download failure")
-        return {"error": f"Download failed: {str(e)}", "accession_number": accession_number}
-
-# ------------------------------------------------------------
-# TOOL: BATCH DOWNLOAD (API URL first)
-# ------------------------------------------------------------
 @mcp.tool()
 async def download_adams_batch(accession_numbers: List[str]) -> Dict[str, Any]:
-    download_logger.info(f"Batch download request: {len(accession_numbers)} docs")
+    """
+    Download multiple ADAMS document PDFs.
 
+    Files are saved to ~/Downloads/ADAMS/.  Maximum 50 per call.
+
+    Args:
+        accession_numbers: List of NRC accession numbers.
+    """
     if not accession_numbers:
         return {"error": "No accession numbers provided"}
     if len(accession_numbers) > 50:
-        return {"error": "Too many documents requested (max 50)"}
+        return {"error": "Too many documents (max 50)"}
 
-    folder_path = get_downloads_folder()
-    results = []
-    success_count = 0
-    failure_count = 0
+    results, success, failure = [], 0, 0
 
-    for acc in accession_numbers:
-        acc = (acc or "").strip().upper()
-        is_valid, error_msg = validate_accession_number(acc)
-        if not is_valid:
-            results.append({"accession": acc, "status": "invalid", "error": error_msg})
-            failure_count += 1
+    for raw in accession_numbers:
+        acc = (raw or "").strip().upper()
+        err = _validate_accession(acc)
+        if err:
+            results.append({"accession": acc, "status": "invalid", "error": err})
+            failure += 1
             continue
 
         try:
-            rate_limiter.wait()
+            _rate.wait()
             doc = client.get_document(acc)
-            url = doc.get_download_url() if doc else None
+            api_url = doc.get_download_url() if doc else None
+        except Exception:
+            api_url = None
 
-            folder = acc[:6]
-            legacy_folder = acc[:4] if not acc.startswith("ML") else None
-            urls_to_try = [u for u in [
-                url,
-                f"https://www.nrc.gov/docs/{folder}/{acc}.pdf",
-                f"https://pbadupws.nrc.gov/docs/{folder}/{acc}.pdf",
-                f"https://www.nrc.gov/reading-rm/doc-collections/ACRS/old-reports/{acc}.pdf" if not acc.startswith("ML") else None,
-                f"https://www.nrc.gov/docs/{legacy_folder}/{acc}.pdf" if legacy_folder else None,
-            ] if u]
+        pdf = None
+        used_url = None
+        for url in _pdf_urls(acc, api_url):
+            pdf = _fetch_pdf(url)
+            if pdf:
+                used_url = url
+                break
 
-            pdf = None
-            used_url = None
-            for u in urls_to_try:
-                pdf = fetch_pdf(u)
-                if pdf:
-                    used_url = u
-                    break
+        if not pdf:
+            results.append({"accession": acc, "status": "failed",
+                             "error": "Could not fetch PDF"})
+            failure += 1
+            continue
 
-            if not pdf:
-                results.append({"accession": acc, "status": "failed", "error": "Could not fetch PDF", "urls_tried": urls_to_try})
-                failure_count += 1
-                continue
+        dest = DOWNLOADS_DIR / f"{acc}.pdf"
+        dest.write_bytes(pdf)
+        results.append({"accession": acc, "status": "success",
+                        "path": str(dest), "url": used_url, "size_bytes": len(pdf)})
+        success += 1
 
-            dest = folder_path / f"{acc}.pdf"
-            dest.write_bytes(pdf)
-            results.append({"accession": acc, "status": "success", "path": str(dest), "url": used_url, "size_bytes": len(pdf)})
-            success_count += 1
+    return {"folder": str(DOWNLOADS_DIR), "total": len(accession_numbers),
+            "success": success, "failed": failure, "results": results}
 
-        except Exception as e:
-            results.append({"accession": acc, "status": "error", "error": str(e)})
-            failure_count += 1
-
-    return {
-        "folder": str(folder_path),
-        "total": len(accession_numbers),
-        "success": success_count,
-        "failed": failure_count,
-        "results": results
-    }
-
-# ------------------------------------------------------------
-# TOOL: SUMMARIZE PDF
-# ------------------------------------------------------------
-def chunk_text(text: str, max_chars: int, chunk_size: int = 1200) -> str:
-    chunks = []
-    total = 0
-    for i in range(0, len(text), chunk_size):
-        chunk = text[i:i + chunk_size]
-        chunks.append(chunk)
-        total += len(chunk)
-        if total >= max_chars:
-            break
-    return " ".join(chunks)
+# ---------------------------------------------------------------------------
+# TOOL: Summarize PDF
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
 async def summarize_pdf(path: str, max_chars: int = 2000) -> Dict[str, Any]:
-    pdf_logger.info(f"PDF summary request: {path}")
+    """
+    Extract and return text from a downloaded ADAMS PDF.
 
+    Only files inside ~/Downloads/ADAMS/ are accessible.
+
+    Args:
+        path:      Full path to the PDF file.
+        max_chars: Maximum characters to return (default 2000).
+    """
     try:
-        path_obj = Path(path).resolve()
-        downloads = get_downloads_folder().resolve()
-
-        if not str(path_obj).startswith(str(downloads)):
+        p = Path(path).resolve()
+        if not str(p).startswith(str(DOWNLOADS_DIR.resolve())):
             return {"error": "Access denied: path outside ADAMS downloads folder", "path": path}
-        if not path_obj.exists():
+        if not p.is_file():
             return {"error": "File not found", "path": path}
-        if not path_obj.is_file():
-            return {"error": "Path is not a file", "path": path}
     except Exception as e:
-        return {"error": f"Invalid path: {str(e)}", "path": path}
+        return {"error": f"Invalid path: {e}", "path": path}
 
     try:
-        reader = PdfReader(str(path_obj))
+        reader = PdfReader(str(p))
         pages = reader.pages
         if not pages:
-            return {"error": "PDF contains no pages", "path": path, "pages": 0}
+            return {"error": "PDF has no pages", "path": path}
 
-        texts = []
-        try:
-            texts.append(pages[0].extract_text() or "")
-        except Exception:
-            pass
-
-        if len(pages) > 1:
-            try:
-                texts.append(pages[-1].extract_text() or "")
-            except Exception:
-                pass
-
-        text = " ".join(texts)
-        text = " ".join(text.split())
-
+        raw = " ".join(
+            filter(None, [
+                (pages[0].extract_text() or ""),
+                (pages[-1].extract_text() or "") if len(pages) > 1 else "",
+            ])
+        )
+        text = " ".join(raw.split())
         if not text:
-            return {"error": "Could not extract text from PDF (may be image-based)", "path": path, "pages": len(pages), "characters": 0}
+            return {"error": "Could not extract text (may be image-based PDF)",
+                    "path": path, "pages": len(pages)}
 
-        summary = chunk_text(text, max_chars)
-        return {"summary": summary, "pages": len(pages), "characters": len(text), "extracted_chars": len(summary), "path": path}
-
+        excerpt = text[:max_chars]
+        return {"summary": excerpt, "pages": len(pages),
+                "characters": len(text), "extracted_chars": len(excerpt), "path": path}
     except Exception as e:
-        pdf_logger.exception("PDF processing failed")
-        return {"error": f"Failed to process PDF: {str(e)}", "path": path}
+        logger.exception("summarize_pdf failed")
+        return {"error": f"PDF processing failed: {e}", "path": path}
 
-# ------------------------------------------------------------
-# RUN
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    logger.info("Starting MCP server (FastMCP legacy API)")
+    logger.info("Running MCP server (stdio transport)")
     mcp.run(transport="stdio")
